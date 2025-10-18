@@ -14,8 +14,10 @@ import pikepdf # NEW: Added for writing PDF metadata
 import uuid    # NEW: Added for generating GUIDs
 import base64  # To encode images for API call
 from openai import OpenAI # To call the vision model
-
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.base_models import InputFormat
 import pdfplumber
+import tempfile
 
 # --- Basic Configuration ---
 # Configure logging
@@ -273,7 +275,8 @@ def pdf_to_json(pdf_path):
         image_output_folder = os.path.join(IMAGE_OUTPUT_DIR, file_id)
         os.makedirs(image_output_folder, exist_ok=True)
 
-        for page_index, page in enumerate(doc):
+        for page_index in range(len(doc)):
+            page = doc[page_index]
             image_list = page.get_images(full=True)
             for img_index, img in enumerate(image_list):
                 xref = img[0]
@@ -297,7 +300,7 @@ def pdf_to_json(pdf_path):
         extracted_tables = extract_tables_with_pdfplumber(pdf_path)
         
         # Extract text using PyMuPDF (keeping existing approach)
-        full_text = "".join(page.get_text() for page in doc)
+        full_text = "".join(page.get_text("text") for page in doc)
         paragraphs = [p.strip() for p in full_text.split('\n') if p.strip()]
         
         # Convert tables to the format expected by your chunking code
@@ -560,7 +563,10 @@ def convert_file():
         
         # NEW: Get image descriptions directly from the API
         logger.info(f"Getting image descriptions for {content.get('filename')}...")
-        image_descriptions = get_image_descriptions_from_api(content.get("images", []))
+        images = content.get("images")
+        if not isinstance(images, list):
+            images = []
+        image_descriptions = get_image_descriptions_from_api(images)
 
         # Create a map of image descriptions by page for easy lookup
         images_by_page = {}
@@ -575,17 +581,19 @@ def convert_file():
         doc = fitz.open(file_path) if file_path.lower().endswith('.pdf') else None
         
         if doc:
-            for page_num, page in enumerate(doc, 1):
-                full_text_parts.append(page.get_text("text"))
+            for page_num in range(1, doc.page_count + 1):
+                page = doc.load_page(page_num - 1)
+                full_text_parts.append(page.get_text())
                 for table in content.get("extracted_tables", []):
-                    if table.get("page") == page_num:
+                    if isinstance(table, dict) and table.get("page") == page_num:
                         full_text_parts.append(format_table_for_rag(table))
                 if page_num in images_by_page:
                     full_text_parts.extend(images_by_page[page_num])
             doc.close()
         else: # Fallback for DOCX or if PDF handling fails to open doc
-            if content.get("paragraphs"):
-                full_text_parts.extend(content.get("paragraphs"))
+            paragraphs = content.get("paragraphs")
+            if isinstance(paragraphs, list):
+                full_text_parts.extend(paragraphs)
             if content.get("extracted_tables"):
                 for table in content.get("extracted_tables", []):
                     full_text_parts.append(format_table_for_rag(table))
@@ -640,6 +648,43 @@ def clear_cache():
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok", "base_directory": BASE_DIR})
+
+
+# Initialize DoclingConverter with desired format options
+docling_converter = DocumentConverter(
+    format_options={
+        InputFormat.PDF: PdfFormatOption(ocr=True),  # Enable OCR for PDFs
+        InputFormat.DOCX: None,  # Use default settings for DOCX
+    }
+)
+
+@app.route('/docling/convert-file', methods=['POST'])
+def docling_convert_file():
+    if not request.files or not 'document' in request.files:
+        return jsonify({"error": "Missing 'document' file in request"}), 400
+
+    file = request.files['document']
+    if not file.filename or '.' not in file.filename or file.filename.split('.')[-1].lower() not in ['pdf', 'docx']:
+        return jsonify({"error": "Unsupported file type. Only PDF and DOCX are accepted."}), 400
+    import tempfile, os
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            file.save(tmp.name)
+            tmp_path = tmp.name
+
+        # Run Docling conversion
+        res = docling_converter.convert(tmp_path)
+        data = res.document.export_to_dict()  # Export DoclingDocument to a dict for JSON serialization
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": f"Error processing file: {str(e)}"}), 500
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception as cleanup_e:
+                logger.warning(f"Could not delete temporary file {tmp_path}: {cleanup_e}")
 
 if __name__ == '__main__':
     print("Starting Flask app...")
