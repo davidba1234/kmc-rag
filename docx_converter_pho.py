@@ -1,0 +1,646 @@
+from flask import Flask, jsonify, request
+import os
+import json
+import glob
+import zipfile
+import xml.etree.ElementTree as ET
+from docx import Document
+from pathlib import Path
+from datetime import datetime, timezone
+import logging
+import time
+import fitz  # PyMuPDF
+import pikepdf # NEW: Added for writing PDF metadata
+import uuid    # NEW: Added for generating GUIDs
+import base64  # To encode images for API call
+from openai import OpenAI # To call the vision model
+
+import pdfplumber
+
+# --- Basic Configuration ---
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("flask_app.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+BASE_DIR = r"C:\\Users\\ander\\Documents\\n8n\\PHO_docs"
+JSON_CACHE_DIR = os.path.join(BASE_DIR, "json_cache")
+IMAGE_OUTPUT_DIR = os.path.join(BASE_DIR, "image_output")
+os.makedirs(JSON_CACHE_DIR, exist_ok=True)
+
+SUPPORTED_EXTENSIONS = ['.docx', '.pdf']
+
+# --- Hardcoded list of all metadata fields to be returned ---
+ALL_METADATA_FIELDS = [
+    "file_id",
+    "filename",
+    "full_path",
+    "subfolder",
+    "file_extension",
+    "file_size",
+    "file_size_mb",
+    "word_count",
+    "character_count",
+    "paragraph_count",
+    "table_count",
+    "last_modified_iso",
+    "created_date_iso",
+    "has_guid",
+    "guid_source",
+    "DateReviewed",
+    "DateNext"
+]
+
+# --- Helper Functions ---
+
+def filter_metadata(metadata, requested_fields=None):
+    fields_to_include = ALL_METADATA_FIELDS if requested_fields is None or requested_fields == "default" else requested_fields
+    if fields_to_include == "all":
+        return metadata
+    return {field: metadata[field] for field in fields_to_include if field in metadata}
+
+def extract_docx_guid(docx_path):
+    try:
+        with zipfile.ZipFile(docx_path, 'r') as docx_zip:
+            settings_path = 'word/settings.xml'
+            if settings_path not in docx_zip.namelist():
+                return None
+            with docx_zip.open(settings_path) as settings_file:
+                root = ET.fromstring(settings_file.read())
+            namespaces = {
+                'w15': 'http://schemas.microsoft.com/office/word/2012/wordml'
+            }
+            doc_id_element = root.find('.//w15:docId', namespaces)
+            if doc_id_element is not None:
+                doc_id = doc_id_element.get('{http://schemas.microsoft.com/office/word/2012/wordml}val')
+                if doc_id:
+                    return doc_id.strip('{}')
+        return None
+    except Exception as e:
+        logger.warning(f"Could not extract GUID from {docx_path}: {e}")
+        return None
+
+# --- NEW: Function to get or create a persistent GUID in a PDF file ---
+def get_or_create_pdf_guid(pdf_path: str) -> str:
+    """
+    Reads a custom GUID from a PDF's metadata. If not present, it generates one,
+    writes it to the PDF's metadata, and saves the file.
+    """
+    guid_key = '/AppGUID'  # Custom metadata key for our GUID
+    try:
+        with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+            docinfo = pdf.docinfo
+            if guid_key in docinfo:
+                logger.info(f"Found existing GUID in {pdf_path}")
+                return str(docinfo[guid_key])
+
+            logger.info(f"No GUID found in {pdf_path}. Generating a new one.")
+            new_guid = str(uuid.uuid4())
+            docinfo[guid_key] = new_guid
+            pdf.save() # Saves the changes to the original file
+            logger.info(f"Saved new GUID to {pdf_path}")
+            return new_guid
+            
+    except Exception as e:
+        logger.error(f"Pikepdf failed to read or write GUID for {pdf_path}: {e}", exc_info=True)
+        # Fallback to filename-based ID if pikepdf fails
+        filename_without_ext = os.path.splitext(os.path.basename(pdf_path))[0]
+        return filename_without_ext.replace(' ', '_').replace('-', '_').lower()
+
+# --- NEW: Read-only function to get a GUID from a PDF for listing purposes ---
+def read_pdf_guid(pdf_path: str) -> str | None:
+    """
+    Reads a custom GUID from a PDF's metadata without modifying the file.
+    Returns None if the GUID is not found.
+    """
+    guid_key = '/AppGUID'
+    try:
+        with pikepdf.open(pdf_path) as pdf:
+            if guid_key in pdf.docinfo:
+                return str(pdf.docinfo[guid_key])
+        return None
+    except Exception as e:
+        logger.warning(f"Could not read GUID from {pdf_path} with pikepdf: {e}")
+        return None
+
+def extract_custom_metadata(doc_path: str):
+    date_reviewed, date_next = None, None
+    try:
+        with zipfile.ZipFile(doc_path, 'r') as z:
+            if 'docProps/custom.xml' not in z.namelist():
+                return date_reviewed, date_next
+            xml_content = z.read('docProps/custom.xml')
+            root = ET.fromstring(xml_content)
+            
+            CP_NAMESPACE = 'http://schemas.openxmlformats.org/officeDocument/2006/custom-properties'
+            VT_NAMESPACE = 'http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'
+            FQN_PROPERTY = f'{{{CP_NAMESPACE}}}property'
+            FQN_FILETIME = f'{{{VT_NAMESPACE}}}filetime'
+
+            for prop in root.findall(FQN_PROPERTY):
+                name = prop.attrib.get('name')
+                if name == 'DateReviewed':
+                    value_elem = prop.find(FQN_FILETIME)
+                    if value_elem is not None and value_elem.text:
+                        date_reviewed = datetime.fromisoformat(value_elem.text.replace('Z', '+00:00')).isoformat()
+                elif name == 'DateNext':
+                    value_elem = prop.find(FQN_FILETIME)
+                    if value_elem is not None and value_elem.text:
+                        date_next = datetime.fromisoformat(value_elem.text.replace('Z', '+00:00')).isoformat()
+    except Exception as e:
+        logger.warning(f"Failed to extract custom metadata from {doc_path}: {e}")
+    return date_reviewed, date_next
+
+def extract_tables_with_pdfplumber(pdf_path):
+    """Extract tables from PDF using pdfplumber"""
+    tables = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                page_tables = page.extract_tables()
+                for table in page_tables or []:
+                    if table and len(table) > 0:
+                        # Clean table data
+                        clean_table = []
+                        for row in table:
+                            clean_row = [cell.strip() if cell else "" for cell in row]
+                            if any(clean_row):  # Skip empty rows
+                                clean_table.append(clean_row)
+                        
+                        if clean_table:
+                            tables.append({
+                                "page": page_num + 1,
+                                "headers": clean_table[0] if clean_table else [],
+                                "rows": clean_table[1:] if len(clean_table) > 1 else [],
+                                "raw_data": clean_table
+                            })
+    except Exception as e:
+        logger.warning(f"pdfplumber table extraction failed for {pdf_path}: {e}")
+    return tables
+
+def format_table_for_rag(table_data):
+    """Format table data for better RAG retrieval"""
+    if not table_data or not table_data.get("raw_data"):
+        return ""
+    
+    raw_data = table_data["raw_data"]
+    formatted_lines = []
+    
+    formatted_lines.append("\n--- TABLE START ---")
+    
+    for row_index, row in enumerate(raw_data):
+        if row and any(cell.strip() for cell in row if cell):
+            row_text = " | ".join([cell for cell in row if cell and cell.strip()])
+            formatted_lines.append(row_text)
+            
+            # Add separator after header row
+            if row_index == 0:
+                formatted_lines.append("-" * 40)
+    
+    formatted_lines.append("--- TABLE END ---\n")
+    return "\n".join(formatted_lines)
+
+# --- Core Conversion Functions ---
+
+def docx_to_json(docx_path):
+    logger.info(f"Starting DOCX conversion for file: {docx_path}")
+    try:
+        doc = Document(docx_path)
+        filename_without_ext, _ = os.path.splitext(os.path.basename(docx_path))
+        filename_based_id = filename_without_ext.replace(' ', '_').replace('-', '_').lower()
+        
+        guid = extract_docx_guid(docx_path)
+        file_id = guid or filename_based_id
+        has_guid = guid is not None
+
+        file_stats = os.stat(docx_path)
+        parent_dir = os.path.basename(os.path.dirname(docx_path))
+        date_reviewed, date_next = extract_custom_metadata(docx_path)
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+        
+        metadata = {
+            "file_id": file_id,
+            "filename": os.path.basename(docx_path),
+            "full_path": docx_path,
+            "subfolder": parent_dir,
+            "paragraph_count": len(paragraphs),
+            "table_count": len(doc.tables),
+            "file_size": file_stats.st_size,
+            "file_size_mb": round(file_stats.st_size / (1024 * 1024), 2),
+            "file_extension": ".docx",
+            "last_modified_iso": datetime.fromtimestamp(file_stats.st_mtime).isoformat(),
+            "created_date_iso": datetime.fromtimestamp(file_stats.st_ctime).isoformat(),
+            "word_count": sum(len(p.split()) for p in paragraphs),
+            "character_count": sum(len(p) for p in paragraphs),
+            "has_guid": has_guid,
+            "guid_source": "docx_settings" if has_guid else "filename_fallback",
+            "DateReviewed": date_reviewed,
+            "DateNext": date_next
+        }
+
+        content = {
+            "file_id": file_id,
+            "filename": os.path.basename(docx_path),
+            "full_path": docx_path,
+            "subfolder": parent_dir,
+            "paragraphs": paragraphs,
+            "tables": [[cell.text.strip() for cell in row.cells] for table in doc.tables for row in table.rows],
+            "metadata": metadata
+        }
+        return content
+    except Exception as e:
+        logger.error(f"Failed to convert {docx_path}: {e}", exc_info=True)
+        return {"error": f"Failed to convert {docx_path}: {str(e)}"}
+
+# --- CHANGED: pdf_to_json now uses the new GUID function ---
+def pdf_to_json(pdf_path):
+    logger.info(f"Starting PDF conversion for file: {pdf_path}")
+    try:
+        # Get or create GUID
+        file_id = get_or_create_pdf_guid(pdf_path) # Use this as a unique folder name for images
+        
+        # --- IMAGE EXTRACTION ---
+        doc = fitz.open(pdf_path)
+        image_info = []
+        image_output_folder = os.path.join(IMAGE_OUTPUT_DIR, file_id)
+        os.makedirs(image_output_folder, exist_ok=True)
+
+        for page_index, page in enumerate(doc):
+            image_list = page.get_images(full=True)
+            for img_index, img in enumerate(image_list):
+                xref = img[0]
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image["image"]
+                image_ext = base_image["ext"]
+                
+                image_filename = f"page{page_index+1}_img{img_index+1}.{image_ext}"
+                image_save_path = os.path.join(image_output_folder, image_filename)
+                
+                with open(image_save_path, "wb") as img_file:
+                    img_file.write(image_bytes)
+                
+                image_info.append({
+                    "path": image_save_path,
+                    "page": page_index + 1,
+                    "xref": xref
+                })
+
+        # Extract tables using pdfplumber
+        extracted_tables = extract_tables_with_pdfplumber(pdf_path)
+        
+        # Extract text using PyMuPDF (keeping existing approach)
+        full_text = "".join(page.get_text() for page in doc)
+        paragraphs = [p.strip() for p in full_text.split('\n') if p.strip()]
+        
+        # Convert tables to the format expected by your chunking code
+        tables_for_chunking = []
+        for table in extracted_tables:
+            if table.get("raw_data"):
+                tables_for_chunking.extend(table["raw_data"])
+
+        # Get file stats
+        file_stats = os.stat(pdf_path)
+        parent_dir = os.path.basename(os.path.dirname(pdf_path))
+
+        metadata = {
+            "file_id": file_id,
+            "filename": os.path.basename(pdf_path),
+            "full_path": pdf_path,
+            "subfolder": parent_dir,
+            "paragraph_count": len(paragraphs),
+            "table_count": len(extracted_tables),  # Now actually counts tables
+            "image_count": len(image_info),
+            "file_size": file_stats.st_size,
+            "file_size_mb": round(file_stats.st_size / (1024 * 1024), 2),
+            "file_extension": ".pdf",
+            "last_modified_iso": datetime.fromtimestamp(file_stats.st_mtime).isoformat(),
+            "created_date_iso": datetime.fromtimestamp(file_stats.st_ctime).isoformat(),
+            "word_count": len(full_text.split()),
+            "character_count": len(full_text),
+            "has_guid": True,
+            "guid_source": "pdf_metadata",
+            "DateReviewed": None,
+            "DateNext": None
+        }
+        
+        content = {
+            "file_id": file_id,
+            "filename": os.path.basename(pdf_path),
+            "full_path": pdf_path,
+            "subfolder": parent_dir,
+            "paragraphs": paragraphs,
+            "tables": tables_for_chunking,  # Now contains actual table data
+            "images": image_info, # List of extracted image paths and info
+            "extracted_tables": extracted_tables,  # Structured table data
+            "metadata": metadata
+        }
+        
+        doc.close()
+        return content
+    except Exception as e:
+        logger.error(f"Failed to convert {pdf_path}: {e}", exc_info=True)
+        return {"error": f"Failed to convert {pdf_path}: {str(e)}"}
+
+def convert_file_to_json(file_path):
+    _, extension = os.path.splitext(file_path)
+    extension = extension.lower()
+    
+    if extension == '.docx':
+        return docx_to_json(file_path)
+    elif extension == '.pdf':
+        return pdf_to_json(file_path)
+    else:
+        logger.warning(f"Unsupported file type: {extension} for file {file_path}")
+        return {"error": f"Unsupported file type: {extension}"}
+
+
+# --- Caching and File System Functions ---
+
+def find_all_supported_files():
+    supported_files = []
+    for ext in SUPPORTED_EXTENSIONS:
+        pattern = os.path.join(BASE_DIR, "**", f"*{ext}")
+        for file_path in glob.glob(pattern, recursive=True):
+            if not os.path.basename(file_path).startswith('~$'):
+                file_stats = os.stat(file_path)
+                parent_dir = os.path.basename(os.path.dirname(file_path))
+                supported_files.append({
+                    "filename": os.path.basename(file_path),
+                    "full_path": file_path,
+                    "subfolder": parent_dir,
+                    "last_modified_iso": datetime.fromtimestamp(file_stats.st_mtime).isoformat()
+                })
+    return supported_files
+
+def get_cache_path(file_path):
+    filename_without_ext = os.path.splitext(os.path.basename(file_path))[0]
+    parent_dir = os.path.basename(os.path.dirname(file_path))
+    cache_name = f"{parent_dir}_{filename_without_ext}.json".replace(' ', '_').replace('-', '_')
+    return os.path.join(JSON_CACHE_DIR, cache_name)
+
+def is_cache_valid(file_path, cache_path):
+    # If the source file was modified, its mtime will be newer than the cache file's.
+    if not os.path.exists(cache_path):
+        return False
+    return os.path.getmtime(cache_path) > os.path.getmtime(file_path)
+
+# In your Flask app
+def create_table_summary(table_data):
+    """Generate a descriptive summary of the table"""
+    if not table_data or not table_data.get("headers"):
+        return ""
+    
+    headers = table_data["headers"]
+    row_count = len(table_data.get("rows", []))
+    
+    summary = f"Table with {row_count} rows containing: {', '.join(headers)}"
+    return summary
+
+# Update metadata
+#metadata.update({
+ #   "table_count": len(all_tables),
+ #   "table_summaries": [create_table_summary(t) for t in all_tables],
+ #   "has_tables": len(all_tables) > 0
+#})
+
+def get_image_descriptions_from_api(image_info_list: list) -> list:
+    """
+    Takes a list of image paths, calls a vision model for each,
+    and returns a list of descriptions.
+    """
+    # API key is read automatically from the OPENAI_API_KEY environment variable
+    try:
+        client = OpenAI()
+    except Exception as e:
+        logger.error(f"OpenAI client failed to initialize. Is OPENAI_API_KEY set? Error: {e}")
+        return []
+
+    descriptions = []
+    for image_info in image_info_list:
+        path = image_info.get("path")
+        try:
+            with open(path, "rb") as image_file:
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "Describe this image from a document in detail. If it's a chart or graph, explain what it shows."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                    ]}
+                ],
+                max_tokens=300,
+            )
+            descriptions.append({"page": image_info.get("page"), "description": response.choices[0].message.content})
+        except Exception as e:
+            logger.error(f"Failed to get description for image {path}: {e}")
+    return descriptions
+
+# --- API Endpoints ---
+# --- ADD THIS NEW ENDPOINT TO YOUR SCRIPT ---
+@app.route('/ensure-guids', methods=['POST'])
+def ensure_guids():
+    """
+    Scans all supported files and ensures that any file missing a GUID gets one.
+    This is a write operation and should be called before /list-files.
+    """
+    logger.info("Received request for /ensure-guids. Scanning all files.")
+    try:
+        all_files = find_all_supported_files()
+        files_updated = 0
+        
+        for file_info in all_files:
+            path = file_info['full_path']
+            guid_found = False
+
+            if path.lower().endswith('.docx'):
+                # DOCX GUIDs are read-only from the file, we can't write them.
+                if extract_docx_guid(path):
+                    guid_found = True
+
+            elif path.lower().endswith('.pdf'):
+                # For PDFs, check if a GUID exists. If not, get_or_create_pdf_guid will create it.
+                existing_guid = read_pdf_guid(path)
+                if existing_guid:
+                    guid_found = True
+                else:
+                    # The file has no GUID, so we create one.
+                    # This function modifies the file.
+                    get_or_create_pdf_guid(path)
+                    files_updated += 1
+                    guid_found = True # It has one now
+
+        message = f"Scan complete. Updated {files_updated} PDF file(s) with a new GUID."
+        logger.info(message)
+        return jsonify({"success": True, "message": message, "files_updated": files_updated})
+
+    except Exception as e:
+        logger.error(f"An error occurred in /ensure-guids: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+    
+# --- CHANGED: /list-files now reads GUIDs from both DOCX and PDF files ---
+@app.route('/list-files', methods=['GET'])
+def list_files():
+    try:
+        file_info_list = find_all_supported_files() 
+        
+        for file_info in file_info_list:
+            try:
+                path = file_info['full_path']
+                mod_time_unix = os.path.getmtime(path)
+                mod_time_iso = datetime.fromtimestamp(mod_time_unix, tz=timezone.utc).isoformat()
+                
+                file_id = None
+                # Check for GUID based on file type
+                if path.lower().endswith('.docx'):
+                    file_id = extract_docx_guid(path)
+                elif path.lower().endswith('.pdf'):
+                    # Use the new read-only function for PDFs
+                    file_id = read_pdf_guid(path)
+
+                # Fallback Identifier
+                if not file_id:
+                    filename_without_ext = os.path.splitext(os.path.basename(path))[0]
+                    file_id = f"fallback_{filename_without_ext.replace(' ', '_').lower()}"
+
+                file_info['lastModified'] = mod_time_iso
+                file_info['file_id'] = file_id
+
+            except Exception as inner_e:
+                logger.error(f"Error processing file {file_info.get('full_path', 'N/A')}: {inner_e}")
+
+        return jsonify({"files": file_info_list, "count": len(file_info_list)})
+
+    except Exception as e:
+        logger.error(f"Error in /list-files: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/convert-file', methods=['POST'])
+def convert_file():
+    logger.info("Received request for /convert-file")
+    data = request.get_json()
+    file_path = data.get('file_path')
+    requested_fields = data.get('metadata_fields')
+    force_refresh = data.get('force_refresh', False)
+
+    if not file_path or not os.path.abspath(file_path).startswith(os.path.abspath(BASE_DIR)):
+        return jsonify({"error": "Invalid or missing file_path"}), 400
+    if not os.path.exists(file_path):
+        return jsonify({"error": "File not found"}), 404
+
+    cache_path = get_cache_path(file_path)
+
+    try:
+        # Note: When a PDF's GUID is written, its mtime is updated,
+        # which will correctly invalidate the cache.
+        if not force_refresh and is_cache_valid(file_path, cache_path):
+            logger.info(f"Loading from cache: {cache_path}")
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                content = json.load(f)
+        else:
+            logger.info(f"Generating new content for: {file_path}")
+            content = convert_file_to_json(file_path)
+            if "error" in content:
+                return jsonify({"error": content["error"]}), 500
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(content, f, ensure_ascii=False, indent=2)
+
+        # --- Assemble the final RAG text here ---
+        full_text_parts = []
+        
+        # NEW: Get image descriptions directly from the API
+        logger.info(f"Getting image descriptions for {content.get('filename')}...")
+        image_descriptions = get_image_descriptions_from_api(content.get("images", []))
+
+        # Create a map of image descriptions by page for easy lookup
+        images_by_page = {}
+        for img_desc in image_descriptions:
+            page_num = img_desc.get("page")
+            if page_num not in images_by_page:
+                images_by_page[page_num] = []
+            images_by_page[page_num].append(f'[Image Description: {img_desc.get("description")}]')
+
+        # Interleave paragraphs, tables, and image descriptions page by page
+        # This logic is safe for both DOCX and PDF because docx will just have 1 page.
+        doc = fitz.open(file_path) if file_path.lower().endswith('.pdf') else None
+        
+        if doc:
+            for page_num, page in enumerate(doc, 1):
+                full_text_parts.append(page.get_text("text"))
+                for table in content.get("extracted_tables", []):
+                    if table.get("page") == page_num:
+                        full_text_parts.append(format_table_for_rag(table))
+                if page_num in images_by_page:
+                    full_text_parts.extend(images_by_page[page_num])
+            doc.close()
+        else: # Fallback for DOCX or if PDF handling fails to open doc
+            if content.get("paragraphs"):
+                full_text_parts.extend(content.get("paragraphs"))
+            if content.get("extracted_tables"):
+                for table in content.get("extracted_tables", []):
+                    full_text_parts.append(format_table_for_rag(table))
+            # For DOCX, just append all image descriptions at the end
+            for page_num in sorted(images_by_page.keys()):
+                 full_text_parts.extend(images_by_page[page_num])
+
+        full_text_for_summary = "\n\n".join(full_text_parts)
+
+        filtered_metadata = filter_metadata(content.get("metadata", {}), requested_fields)
+            
+            # Return a response that serves both the AI summarizer and the smart chunker
+        return jsonify({
+                "success": True,
+                "file_info": {
+                "filename": content.get("filename"),
+                "subfolder": content.get("subfolder"),
+                "file_id": content.get("file_id"),
+                "full_path": content.get("full_path")
+            },
+            "full_text": full_text_for_summary, # Now includes image descriptions
+            "structured_content": {
+                "paragraphs": content.get("paragraphs"),
+                "tables": content.get("tables"),
+                "extracted_tables": content.get("extracted_tables"),
+                "images": content.get("images")
+            },
+            "metadata": filtered_metadata
+        })
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in /convert-file for {file_path}: {e}", exc_info=True)
+        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+
+
+@app.route('/clear-cache', methods=['POST'])
+def clear_cache():
+    try:
+        if not os.path.exists(JSON_CACHE_DIR):
+            return jsonify({"success": True, "message": "Cache directory doesn't exist, nothing to clear", "files_deleted": 0})
+        cache_files = glob.glob(os.path.join(JSON_CACHE_DIR, "*.json"))
+        files_deleted = 0
+        for cache_file in cache_files:
+            try:
+                os.remove(cache_file)
+                files_deleted += 1
+            except Exception as e:
+                logger.warning(f"Could not delete {cache_file}: {e}")
+        return jsonify({"success": True, "message": f"Cache cleared successfully", "files_deleted": files_deleted, "cache_directory": JSON_CACHE_DIR})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok", "base_directory": BASE_DIR})
+
+if __name__ == '__main__':
+    print("Starting Flask app...")
+    app.run(host='127.0.0.1', port=5001, debug=True)
