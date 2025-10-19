@@ -14,7 +14,10 @@ import pikepdf # NEW: Added for writing PDF metadata
 import uuid    # NEW: Added for generating GUIDs
 import base64  # To encode images for API call
 from openai import OpenAI # To call the vision model
-from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.document_converter import DocumentConverter, PdfFormatOption, WordFormatOption
+from docling.datamodel.pipeline_options import (
+    PdfPipelineOptions, TableStructureOptions, TableFormerMode
+)
 from docling.datamodel.base_models import InputFormat
 import pdfplumber
 import tempfile
@@ -649,12 +652,20 @@ def clear_cache():
 def health():
     return jsonify({"status": "ok", "base_directory": BASE_DIR})
 
+pdf_opts = PdfPipelineOptions(
+    do_ocr=True,                      # enable OCR on scanned PDFs
+    do_table_structure=True,          # run table structure model
+    table_structure_options=TableStructureOptions(
+        mode=TableFormerMode.ACCURATE # FAST or ACCURATE
+    )
+)
+
 
 # Initialize Docling converter with desired format options
 docling_converter = DocumentConverter(
     format_options={
-        InputFormat.PDF: PdfFormatOption(ocr=True),  # Enable OCR for PDFs
-        InputFormat.DOCX: None,  # Use default settings for DOCX
+        InputFormat.PDF:  PdfFormatOption(pipeline_options=pdf_opts),
+        InputFormat.DOCX: WordFormatOption(),   # defaults are fine
     }
 )
 
