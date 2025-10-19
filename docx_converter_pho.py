@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-BASE_DIR = r"C:\\Users\\ander\\Documents\\n8n\\PHO_docs"
+BASE_DIR = r"C:\\Users\\ander\\Documents\\n8n\\test_docs"
 JSON_CACHE_DIR = os.path.join(BASE_DIR, "json_cache")
 IMAGE_OUTPUT_DIR = os.path.join(BASE_DIR, "image_output")
 os.makedirs(JSON_CACHE_DIR, exist_ok=True)
@@ -583,7 +583,7 @@ def convert_file():
         if doc:
             for page_num in range(1, doc.page_count + 1):
                 page = doc.load_page(page_num - 1)
-                full_text_parts.append(page.get_text())
+                full_text_parts.append(page.get_text("text"))
                 for table in content.get("extracted_tables", []):
                     if isinstance(table, dict) and table.get("page") == page_num:
                         full_text_parts.append(format_table_for_rag(table))

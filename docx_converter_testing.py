@@ -299,8 +299,8 @@ def pdf_to_json(pdf_path):
         # Extract tables using pdfplumber
         extracted_tables = extract_tables_with_pdfplumber(pdf_path)
         
-        # Extract text using PyMuPDF (keeping existing approach)
-        full_text = "".join(page.get_text("text") for page in doc)
+        # Extract text using PyMuPDF (compatible with older PyMuPDF versions)
+        full_text = "".join(page.get_textpage().extractText() for page in doc)
         paragraphs = [p.strip() for p in full_text.split('\n') if p.strip()]
         
         # Convert tables to the format expected by your chunking code
@@ -650,7 +650,7 @@ def health():
     return jsonify({"status": "ok", "base_directory": BASE_DIR})
 
 
-# Initialize DoclingConverter with desired format options
+# Initialize Docling converter with desired format options
 docling_converter = DocumentConverter(
     format_options={
         InputFormat.PDF: PdfFormatOption(ocr=True),  # Enable OCR for PDFs
@@ -660,31 +660,52 @@ docling_converter = DocumentConverter(
 
 @app.route('/docling/convert-file', methods=['POST'])
 def docling_convert_file():
-    if not request.files or not 'document' in request.files:
-        return jsonify({"error": "Missing 'document' file in request"}), 400
-
-    file = request.files['document']
-    if not file.filename or '.' not in file.filename or file.filename.split('.')[-1].lower() not in ['pdf', 'docx']:
-        return jsonify({"error": "Unsupported file type. Only PDF and DOCX are accepted."}), 400
-    import tempfile, os
-    tmp_path = None
+    """
+    Convert a document using Docling by file path
+    Expected JSON payload: {"file_path": "C:\\path\\to\\your\\file.pdf"}
+    """
     try:
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            file.save(tmp.name)
-            tmp_path = tmp.name
-
-        # Run Docling conversion
-        res = docling_converter.convert(tmp_path)
-        data = res.document.export_to_dict()  # Export DoclingDocument to a dict for JSON serialization
-        return jsonify(data)
+        data = request.get_json()
+        if not data or 'file_path' not in data:
+            return jsonify({"error": "Missing 'file_path' in JSON request body"}), 400
+        
+        file_path = data['file_path']
+        
+        # Validate file exists
+        if not os.path.exists(file_path):
+            return jsonify({"error": f"File not found: {file_path}"}), 404
+        
+        # Validate file extension
+        file_extension = os.path.splitext(file_path)[1].lower()
+        if file_extension not in ['.pdf', '.docx']:
+            return jsonify({"error": f"Unsupported file type: {file_extension}. Only PDF and DOCX are supported."}), 400
+        
+        # Security check - ensure file is within your base directory (optional but recommended)
+        if not os.path.abspath(file_path).startswith(os.path.abspath(BASE_DIR)):
+            return jsonify({"error": "File path is outside allowed directory"}), 403
+        
+        logger.info(f"Starting Docling conversion for: {file_path}")
+        
+        # Run Docling conversion - this accepts the file path directly
+        conversion_result = docling_converter.convert(file_path)
+        document = conversion_result.document
+        
+        # Export to dictionary for JSON serialization
+        document_dict = document.export_to_dict()
+        
+        logger.info(f"Successfully converted {file_path} using Docling")
+        
+        return jsonify({
+            "success": True,
+            "file_path": file_path,
+            "filename": os.path.basename(file_path),
+            "document": document_dict,
+            "conversion_status": str(conversion_result.status)
+        })
+        
     except Exception as e:
+        logger.error(f"Error processing file with Docling: {e}", exc_info=True)
         return jsonify({"error": f"Error processing file: {str(e)}"}), 500
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except Exception as cleanup_e:
-                logger.warning(f"Could not delete temporary file {tmp_path}: {cleanup_e}")
 
 if __name__ == '__main__':
     print("Starting Flask app...")
