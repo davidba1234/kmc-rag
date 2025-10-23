@@ -21,6 +21,7 @@ from docling.datamodel.pipeline_options import (
 from docling.datamodel.base_models import InputFormat
 import pdfplumber
 import tempfile
+import zipfile
 
 # --- Basic Configuration ---
 # Configure logging
@@ -71,6 +72,29 @@ def filter_metadata(metadata, requested_fields=None):
     if fields_to_include == "all":
         return metadata
     return {field: metadata[field] for field in fields_to_include if field in metadata}
+
+def make_common_metadata(file_path, extra=None):
+    """Return common metadata dictionary for both converters."""
+    file_stats = os.stat(file_path)
+    parent_dir = os.path.basename(os.path.dirname(file_path))
+    filename = os.path.basename(file_path)
+    ext = os.path.splitext(filename)[1].lower()
+
+    metadata = {
+        "filename": filename,
+        "full_path": file_path,
+        "subfolder": parent_dir,
+        "file_extension": ext,
+        "file_size": file_stats.st_size,
+        "file_size_mb": round(file_stats.st_size / (1024 * 1024), 2),
+        "last_modified_iso": datetime.fromtimestamp(file_stats.st_mtime).isoformat(),
+        "created_date_iso": datetime.fromtimestamp(file_stats.st_ctime).isoformat(),
+    }
+
+    if extra and isinstance(extra, dict):
+        metadata.update(extra)
+
+    return metadata
 
 def extract_docx_guid(docx_path):
     try:
@@ -163,6 +187,65 @@ def extract_custom_metadata(doc_path: str):
     except Exception as e:
         logger.warning(f"Failed to extract custom metadata from {doc_path}: {e}")
     return date_reviewed, date_next
+
+
+
+# Heuristic: decide if DOCX is complex enough for docling
+def is_docx_complex(docx_path,
+                    min_tables_for_complex=1,
+                    min_images_for_complex=1,
+                    max_paragraphs_for_simple=300,
+                    avg_run_threshold=2.5):
+    """
+    Returns True if the DOCX should be processed by Docling (complex),
+    False if we should use your lightweight python-docx extractor (simple).
+    Tune the thresholds as needed.
+    """
+    try:
+        # Fast checks via zip (counts media files and presence of embedded objects)
+        with zipfile.ZipFile(docx_path, 'r') as z:
+            namelist = z.namelist()
+            media_files = [n for n in namelist if n.startswith('word/media/')]
+            embedded_objects = [n for n in namelist if n.startswith('word/embeddings') or n.endswith('.bin')]
+            has_images = len(media_files) >= min_images_for_complex
+            has_embedded = len(embedded_objects) > 0
+
+        # Use python-docx for tables and paragraph/run complexity
+        doc = Document(docx_path)
+        num_tables = len(doc.tables)
+        num_paragraphs = len(doc.paragraphs)
+
+        # measure average runs per paragraph as a crude measure of formatting complexity
+        total_runs = 0
+        paragraphs_sampled = 0
+        for p in doc.paragraphs:
+            # skip empty paragraphs for run averaging
+            if not p.text.strip():
+                continue
+            paragraphs_sampled += 1
+            try:
+                total_runs += len(p.runs)
+            except Exception:
+                total_runs += 1
+            if paragraphs_sampled >= 200:
+                break
+        avg_runs = (total_runs / paragraphs_sampled) if paragraphs_sampled else 1
+
+        # Decide complexity:
+        if num_tables >= min_tables_for_complex:
+            return True
+        if has_images or has_embedded:
+            return True
+        if num_paragraphs > max_paragraphs_for_simple:
+            return True
+        if avg_runs > avg_run_threshold:
+            return True
+
+        return False
+    except Exception as e:
+        logger.warning(f"is_docx_complex failed for {docx_path}: {e}", exc_info=True)
+        # Conservative approach: if we fail to inspect, use docling to be safe
+        return True
 
 def extract_tables_with_pdfplumber(pdf_path):
     """Extract tables from PDF using pdfplumber"""
@@ -586,7 +669,7 @@ def convert_file():
         if doc:
             for page_num in range(1, doc.page_count + 1):
                 page = doc.load_page(page_num - 1)
-                full_text_parts.append(page.get_text("text"))
+                full_text_parts.append(page.get_textpage().extractText())
                 for table in content.get("extracted_tables", []):
                     if isinstance(table, dict) and table.get("page") == page_num:
                         full_text_parts.append(format_table_for_rag(table))
@@ -672,51 +755,147 @@ docling_converter = DocumentConverter(
 @app.route('/docling/convert-file', methods=['POST'])
 def docling_convert_file():
     """
-    Convert a document using Docling by file path
-    Expected JSON payload: {"file_path": "C:\\path\\to\\your\\file.pdf"}
+    Convert a document using either the lightweight python-docx converter
+    (docx_to_json) or Docling. Input JSON: {"file_path": "...", "force_refresh": false}
+    Returns consistent JSON including metadata and which converter was used.
     """
     try:
-        data = request.get_json()
+        data = request.get_json(force=True)
         if not data or 'file_path' not in data:
             return jsonify({"error": "Missing 'file_path' in JSON request body"}), 400
-        
         file_path = data['file_path']
-        
-        # Validate file exists
+        force_refresh = data.get("force_refresh", False)
+        requested_fields = data.get("metadata_fields", None)
+
+        # Basic validations
         if not os.path.exists(file_path):
             return jsonify({"error": f"File not found: {file_path}"}), 404
-        
-        # Validate file extension
-        file_extension = os.path.splitext(file_path)[1].lower()
-        if file_extension not in ['.pdf', '.docx']:
-            return jsonify({"error": f"Unsupported file type: {file_extension}. Only PDF and DOCX are supported."}), 400
-        
-        # Security check - ensure file is within your base directory (optional but recommended)
         if not os.path.abspath(file_path).startswith(os.path.abspath(BASE_DIR)):
             return jsonify({"error": "File path is outside allowed directory"}), 403
-        
-        logger.info(f"Starting Docling conversion for: {file_path}")
-        
-        # Run Docling conversion - this accepts the file path directly
+
+        ext = os.path.splitext(file_path)[1].lower()
+
+        # Decide converter
+        use_docling = False
+        if ext == '.pdf':
+            use_docling = True
+        elif ext == '.docx':
+            # run heuristic
+            use_docling = is_docx_complex(file_path)
+        else:
+            return jsonify({"error": f"Unsupported file type: {ext}"}), 400
+
+        logger.info(f"convert-file: {file_path} selected converter = {'docling' if use_docling else 'native'}")
+
+        # ---------- Native lightweight docx path ----------
+        if ext == '.docx' and not use_docling:
+            content = docx_to_json(file_path)
+            if "error" in content:
+                return jsonify({"error": content["error"]}), 500
+
+            # ensure we attach the custom properties you already extract
+            date_reviewed, date_next = extract_custom_metadata(file_path)
+            metadata_extra = {
+                "has_guid": content.get("metadata", {}).get("has_guid") if isinstance(content.get("metadata", {}), dict) else None,
+                "guid_source": content.get("metadata", {}).get("guid_source") if isinstance(content.get("metadata", {}), dict) else None,
+                "DateReviewed": date_reviewed,
+                "DateNext": date_next
+            }
+            common_meta = make_common_metadata(file_path, metadata_extra)
+
+            # filter fields if requested:
+            metadata_dict = content.get("metadata", {})
+            if not isinstance(metadata_dict, dict):
+                metadata_dict = {}
+            filtered_meta = filter_metadata({**metadata_dict, **common_meta}, requested_fields)
+
+            return jsonify({
+                "success": True,
+                "used_converter": "native_docx",
+                "file_path": file_path,
+                "filename": content.get("filename"),
+                "structured_content": {
+                    "paragraphs": content.get("paragraphs"),
+                    "tables": content.get("tables"),
+                    # keep the original metadata block too
+                    "metadata": content.get("metadata")
+                },
+                "full_text": "\n\n".join(content.get("paragraphs", [])),
+                "metadata": filtered_meta
+            })
+
+        # ---------- Docling path (for PDFs and complex DOCX) ----------
+        logger.info("Running Docling converter...")
         conversion_result = docling_converter.convert(file_path)
         document = conversion_result.document
-        
-        # Export to dictionary for JSON serialization
+        # Export to a serializable dict (Docling's export)
         document_dict = document.export_to_dict()
-        
-        logger.info(f"Successfully converted {file_path} using Docling")
-        
+
+        # Collect custom properties for docx files too (Docling won't automatically expose them)
+        custom_date_reviewed = None
+        custom_date_next = None
+        if ext == '.docx':
+            custom_date_reviewed, custom_date_next = extract_custom_metadata(file_path)
+        elif ext == '.pdf':
+            # For PDFs, if you want GUIDs recorded, use read_pdf_guid
+            pdf_guid = read_pdf_guid(file_path)
+        # Compose metadata
+        extra_meta = {}
+        if ext == '.docx':
+            extra_meta.update({"DateReviewed": custom_date_reviewed, "DateNext": custom_date_next})
+        if ext == '.pdf':
+            # attach GUID if present
+            extra_meta.update({"has_guid": True, "guid_source": "pdf_metadata", "pdf_guid": read_pdf_guid(file_path)})
+
+        common_meta = make_common_metadata(file_path, extra_meta)
+
+        # Merge into a metadata bag and also include Docling's origin if present
+        origin_meta = {}
+        try:
+            origin_meta = document_dict.get("origin", {}) or {}
+        except Exception:
+            origin_meta = {}
+
+        # final metadata to return (filtered)
+        merged_meta = {**common_meta, **origin_meta}
+        filtered_meta = filter_metadata(merged_meta, requested_fields)
+
         return jsonify({
             "success": True,
+            "used_converter": "docling",
             "file_path": file_path,
             "filename": os.path.basename(file_path),
+            "conversion_status": str(conversion_result.status),
             "document": document_dict,
-            "conversion_status": str(conversion_result.status)
+            "metadata": filtered_meta
         })
-        
+
     except Exception as e:
-        logger.error(f"Error processing file with Docling: {e}", exc_info=True)
+        logger.error(f"Error processing file with Docling/native: {e}", exc_info=True)
         return jsonify({"error": f"Error processing file: {str(e)}"}), 500
+
+@app.route('/docling/convert-all', methods=['POST'])
+def docling_convert_all():
+    """
+    Batch-convert all supported files under BASE_DIR using the Docling path.
+    Returns a list of results with status per file.
+    """
+    results = []
+    files = find_all_supported_files()
+    for f in files:
+        path = f.get("full_path")
+        try:
+            # decide converter like your existing logic (here we force Docling)
+            conversion_result = docling_converter.convert(path)
+            results.append({
+                "file": path,
+                "status": str(conversion_result.status),
+                "success": True
+            })
+        except Exception as e:
+            logger.error(f"Batch convert failed for {path}: {e}", exc_info=True)
+            results.append({"file": path, "success": False, "error": str(e)})
+    return jsonify({"results": results, "count": len(results)})
 
 if __name__ == '__main__':
     print("Starting Flask app...")
