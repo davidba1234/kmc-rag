@@ -909,7 +909,10 @@ def perform_chunking(input_text, meta, options):
         )
         raw_chunks = chunker.chunk(input_text)
 
- 
+        # Load embedding model (do this here or globally to avoid repeated loads)
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer(options.get("embedding_model", "pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb"))
+
         # Enrich and embed each chunk
         enriched_chunks = []
         for chunk in raw_chunks:
