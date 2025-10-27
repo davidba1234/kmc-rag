@@ -22,6 +22,7 @@ from docling.datamodel.base_models import InputFormat
 import pdfplumber
 import tempfile
 import zipfile
+from chonkie import SemanticChunker
 
 # --- Basic Configuration ---
 # Configure logging
@@ -752,6 +753,13 @@ docling_converter = DocumentConverter(
     }
 )
 
+# ... (Your existing imports remain the same)
+
+# NEW: Imports for Chonkie SemanticChunker
+
+
+# ... (Your existing code up to the /docling/convert-file endpoint remains the same)
+
 @app.route('/docling/convert-file', methods=['POST'])
 def docling_convert_file():
     """
@@ -766,6 +774,10 @@ def docling_convert_file():
         file_path = data['file_path']
         force_refresh = data.get("force_refresh", False)
         requested_fields = data.get("metadata_fields", None)
+        
+        # NEW: Get chunking flags/options from request (optional)
+        do_chunking = data.get("do_chunking", False)  # If true, perform chunking
+        chunking_options = data.get("chunking_options", {})  # Optional dict for config
 
         # Basic validations
         if not os.path.exists(file_path):
@@ -808,6 +820,14 @@ def docling_convert_file():
             if not isinstance(metadata_dict, dict):
                 metadata_dict = {}
             filtered_meta = filter_metadata({**metadata_dict, **common_meta}, requested_fields)
+            
+            # NEW: Prepare text for chunking (join paragraphs)
+            full_text = "\n\n".join(content.get("paragraphs", []))
+
+            # NEW: Chunk if requested (after native conversion)
+            chunks = []
+            if do_chunking:
+                chunks = perform_chunking(full_text, filtered_meta, chunking_options)
 
             return jsonify({
                 "success": True,
@@ -820,8 +840,9 @@ def docling_convert_file():
                     # keep the original metadata block too
                     "metadata": content.get("metadata")
                 },
-                "full_text": "\n\n".join(content.get("paragraphs", [])),
-                "metadata": filtered_meta
+                "full_text": full_text,  # Updated to use the prepared text
+                "metadata": filtered_meta,
+                "chunks": chunks  # NEW: Add chunks if do_chunking=True
             })
 
         # ---------- Docling path (for PDFs and complex DOCX) ----------
@@ -859,6 +880,14 @@ def docling_convert_file():
         # final metadata to return (filtered)
         merged_meta = {**common_meta, **origin_meta}
         filtered_meta = filter_metadata(merged_meta, requested_fields)
+        
+        # NEW: Prepare text for chunking (use Markdown for structure)
+        full_text = document.export_to_markdown()  # Preserves tables/headings; fallback to export_to_text() if needed
+
+        # NEW: Chunk if requested (after Docling conversion)
+        chunks = []
+        if do_chunking:
+            chunks = perform_chunking(full_text, filtered_meta, chunking_options)
 
         return jsonify({
             "success": True,
@@ -867,12 +896,61 @@ def docling_convert_file():
             "filename": os.path.basename(file_path),
             "conversion_status": str(conversion_result.status),
             "document": document_dict,
-            "metadata": filtered_meta
+            "metadata": filtered_meta,
+            "full_text": full_text,  # NEW: Add full_text for consistency with native path
+            "chunks": chunks  # NEW: Add chunks if do_chunking=True
         })
 
     except Exception as e:
         logger.error(f"Error processing file with Docling/native: {e}", exc_info=True)
         return jsonify({"error": f"Error processing file: {str(e)}"}), 500
+
+# NEW: Helper function to perform chunking (reusable for both native and Docling paths)
+def perform_chunking(input_text: str, metadata: dict, options: dict) -> list:
+    """
+    Chunks the input text using SemanticChunker.
+    Enriches each chunk with basic metadata.
+    Options dict can include: embedding_model, threshold, chunk_size, device_map.
+    """
+    try:
+        # Default options (tuned for medical PDFs)
+        embedding_model = options.get("embedding_model", "pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb")  # Biomedical-tuned
+        threshold = options.get("threshold", 0.75)
+        chunk_size = options.get("chunk_size", 512)
+        device_map = options.get("device_map", "cpu")  # Use "cuda" if GPU available
+
+        chunker = SemanticChunker(
+            embedding_model=embedding_model,
+            threshold=threshold,
+            chunk_size=chunk_size,
+            device_map=device_map
+        )
+        
+        chunks = chunker.chunk(input_text)
+        
+        # Enrich with metadata (basic example; expand as needed)
+        enriched_chunks = []
+        for chunk in chunks:
+            enriched_chunks.append({
+                "text": chunk.text,
+                "token_count": chunk.token_count,
+                "start_index": chunk.start_index,
+                "end_index": chunk.end_index,
+                "metadata": {  # Attach file-level metadata
+                    "file_id": metadata.get("file_id"),
+                    "filename": metadata.get("filename"),
+                    # Add more, e.g., map indices to pages if needed
+                }
+            })
+        
+        logger.info(f"Chunking complete: {len(enriched_chunks)} chunks generated.")
+        return enriched_chunks
+    
+    except Exception as e:
+        logger.error(f"Chunking failed: {e}", exc_info=True)
+        return []  # Return empty list on failure to not crash the endpoint
+
+# ... (Your existing /docling/convert-all endpoint and app.run() remain the same)
 
 @app.route('/docling/convert-all', methods=['POST'])
 def docling_convert_all():
