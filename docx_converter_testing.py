@@ -22,7 +22,7 @@ from docling.datamodel.base_models import InputFormat
 import pdfplumber
 import tempfile
 import zipfile
-from chonkie import SemanticChunker
+from chonkie import SemanticChunker # type: ignore
 
 # --- Basic Configuration ---
 # Configure logging
@@ -762,11 +762,6 @@ docling_converter = DocumentConverter(
 
 @app.route('/docling/convert-file', methods=['POST'])
 def docling_convert_file():
-    """
-    Convert a document using either the lightweight python-docx converter
-    (docx_to_json) or Docling. Input JSON: {"file_path": "...", "force_refresh": false}
-    Returns consistent JSON including metadata and which converter was used.
-    """
     try:
         data = request.get_json(force=True)
         if not data or 'file_path' not in data:
@@ -774,12 +769,10 @@ def docling_convert_file():
         file_path = data['file_path']
         force_refresh = data.get("force_refresh", False)
         requested_fields = data.get("metadata_fields", None)
-        
-        # NEW: Get chunking flags/options from request (optional)
-        do_chunking = data.get("do_chunking", False)  # If true, perform chunking
-        chunking_options = data.get("chunking_options", {})  # Optional dict for config
+        do_chunking = data.get("do_chunking", False)  # NEW: Option to trigger chunking
+        chunking_options = data.get("chunking_options", {})  # e.g., {"threshold": 0.75}
 
-        # Basic validations
+        # Basic validations (existing)
         if not os.path.exists(file_path):
             return jsonify({"error": f"File not found: {file_path}"}), 404
         if not os.path.abspath(file_path).startswith(os.path.abspath(BASE_DIR)):
@@ -787,12 +780,27 @@ def docling_convert_file():
 
         ext = os.path.splitext(file_path)[1].lower()
 
-        # Decide converter
+        # NEW: Fetch GUID early using your functions
+        guid = None
+        guid_source = "unknown"
+        if ext == '.pdf':
+            guid = get_or_create_pdf_guid(file_path)  # Creates if missing, as per your function
+            guid_source = "pdf_metadata"
+        elif ext == '.docx':
+            guid = extract_docx_guid(file_path)
+            if guid:
+                guid_source = "docx_settings"
+            else:
+                # Fallback to filename-based (as in your code)
+                filename_without_ext = os.path.splitext(os.path.basename(file_path))[0]
+                guid = filename_without_ext.replace(' ', '_').replace('-', '_').lower()
+                guid_source = "filename_fallback"
+
+        # Decide converter (existing logic)
         use_docling = False
         if ext == '.pdf':
             use_docling = True
         elif ext == '.docx':
-            # run heuristic
             use_docling = is_docx_complex(file_path)
         else:
             return jsonify({"error": f"Unsupported file type: {ext}"}), 400
@@ -805,89 +813,71 @@ def docling_convert_file():
             if "error" in content:
                 return jsonify({"error": content["error"]}), 500
 
-            # ensure we attach the custom properties you already extract
             date_reviewed, date_next = extract_custom_metadata(file_path)
             metadata_extra = {
-                "has_guid": content.get("metadata", {}).get("has_guid") if isinstance(content.get("metadata", {}), dict) else None,
-                "guid_source": content.get("metadata", {}).get("guid_source") if isinstance(content.get("metadata", {}), dict) else None,
+                "has_guid": bool(guid),  # Updated to use your GUID
+                "guid_source": guid_source,
                 "DateReviewed": date_reviewed,
                 "DateNext": date_next
             }
             common_meta = make_common_metadata(file_path, metadata_extra)
+            common_meta["file_id"] = guid  # Attach your GUID here
 
-            # filter fields if requested:
+            # Filter metadata (existing)
             metadata_dict = content.get("metadata", {})
             if not isinstance(metadata_dict, dict):
                 metadata_dict = {}
             filtered_meta = filter_metadata({**metadata_dict, **common_meta}, requested_fields)
-            
-            # NEW: Prepare text for chunking (join paragraphs)
+
             full_text = "\n\n".join(content.get("paragraphs", []))
 
-            # NEW: Chunk if requested (after native conversion)
+            # NEW: Chunking if requested
             chunks = []
             if do_chunking:
-                chunks = perform_chunking(full_text, filtered_meta, chunking_options)
+                chunks = perform_chunking(full_text, common_meta, chunking_options)  # See helper function below
 
             return jsonify({
                 "success": True,
                 "used_converter": "native_docx",
                 "file_path": file_path,
                 "filename": content.get("filename"),
+                "full_text": full_text,
                 "structured_content": {
                     "paragraphs": content.get("paragraphs"),
                     "tables": content.get("tables"),
-                    # keep the original metadata block too
                     "metadata": content.get("metadata")
                 },
-                "full_text": full_text,  # Updated to use the prepared text
                 "metadata": filtered_meta,
-                "chunks": chunks  # NEW: Add chunks if do_chunking=True
+                "chunks": chunks  # Enriched with GUID
             })
 
         # ---------- Docling path (for PDFs and complex DOCX) ----------
         logger.info("Running Docling converter...")
         conversion_result = docling_converter.convert(file_path)
         document = conversion_result.document
-        # Export to a serializable dict (Docling's export)
         document_dict = document.export_to_dict()
 
-        # Collect custom properties for docx files too (Docling won't automatically expose them)
-        custom_date_reviewed = None
-        custom_date_next = None
-        if ext == '.docx':
-            custom_date_reviewed, custom_date_next = extract_custom_metadata(file_path)
-        elif ext == '.pdf':
-            # For PDFs, if you want GUIDs recorded, use read_pdf_guid
-            pdf_guid = read_pdf_guid(file_path)
-        # Compose metadata
+        # Custom metadata (existing, but attach your GUID)
         extra_meta = {}
         if ext == '.docx':
-            extra_meta.update({"DateReviewed": custom_date_reviewed, "DateNext": custom_date_next})
-        if ext == '.pdf':
-            # attach GUID if present
-            extra_meta.update({"has_guid": True, "guid_source": "pdf_metadata", "pdf_guid": read_pdf_guid(file_path)})
+            date_reviewed, date_next = extract_custom_metadata(file_path)
+            extra_meta.update({"DateReviewed": date_reviewed, "DateNext": date_next})
+        extra_meta.update({"file_id": guid, "has_guid": bool(guid), "guid_source": guid_source})
 
         common_meta = make_common_metadata(file_path, extra_meta)
 
-        # Merge into a metadata bag and also include Docling's origin if present
-        origin_meta = {}
-        try:
-            origin_meta = document_dict.get("origin", {}) or {}
-        except Exception:
-            origin_meta = {}
-
-        # final metadata to return (filtered)
+        # Merge and filter metadata (existing)
+        origin_meta = document_dict.get("origin", {}) or {}
         merged_meta = {**common_meta, **origin_meta}
         filtered_meta = filter_metadata(merged_meta, requested_fields)
-        
-        # NEW: Prepare text for chunking (use Markdown for structure)
-        full_text = document.export_to_markdown()  # Preserves tables/headings; fallback to export_to_text() if needed
 
-        # NEW: Chunk if requested (after Docling conversion)
+        # NEW: Export full_text from Docling (for chunking)
+        full_text = document.export_to_markdown()  # Or export_to_text() for plain
+
+        # NEW: Chunking if requested
         chunks = []
         if do_chunking:
-            chunks = perform_chunking(full_text, filtered_meta, chunking_options)
+            chunks = perform_chunking(full_text, merged_meta, chunking_options)  # See helper function below
 
         return jsonify({
             "success": True,
@@ -896,59 +886,53 @@ def docling_convert_file():
             "filename": os.path.basename(file_path),
             "conversion_status": str(conversion_result.status),
             "document": document_dict,
+            "full_text": full_text,
             "metadata": filtered_meta,
-            "full_text": full_text,  # NEW: Add full_text for consistency with native path
-            "chunks": chunks  # NEW: Add chunks if do_chunking=True
+            "chunks": chunks  # Enriched with GUID
         })
 
     except Exception as e:
         logger.error(f"Error processing file with Docling/native: {e}", exc_info=True)
         return jsonify({"error": f"Error processing file: {str(e)}"}), 500
 
-# NEW: Helper function to perform chunking (reusable for both native and Docling paths)
-def perform_chunking(input_text: str, metadata: dict, options: dict) -> list:
-    """
-    Chunks the input text using SemanticChunker.
-    Enriches each chunk with basic metadata.
-    Options dict can include: embedding_model, threshold, chunk_size, device_map.
-    """
+# NEW: Helper function for chunking and enrichment (call from both paths)
+# In docx_converter_testing.py (update the perform_chunking function)
+def perform_chunking(input_text, meta, options):
+    """Performs semantic chunking, embedding, and enriches with metadata including your GUID."""
     try:
-        # Default options (tuned for medical PDFs)
-        embedding_model = options.get("embedding_model", "pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb")  # Biomedical-tuned
-        threshold = options.get("threshold", 0.75)
-        chunk_size = options.get("chunk_size", 512)
-        device_map = options.get("device_map", "cpu")  # Use "cuda" if GPU available
-
+        # Initialize SemanticChunker with user-provided options
         chunker = SemanticChunker(
-            embedding_model=embedding_model,
-            threshold=threshold,
-            chunk_size=chunk_size,
-            device_map=device_map
+            embedding_model=options.get("embedding_model", "pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb"),
+            threshold=options.get("threshold", 0.75),
+            chunk_size=options.get("chunk_size", 512),
+            device_map="cpu"  # Or "cuda" if GPU available
         )
-        
-        chunks = chunker.chunk(input_text)
-        
-        # Enrich with metadata (basic example; expand as needed)
+        raw_chunks = chunker.chunk(input_text)
+
+ 
+        # Enrich and embed each chunk
         enriched_chunks = []
-        for chunk in chunks:
-            enriched_chunks.append({
+        for chunk in raw_chunks:
+            enriched = {
                 "text": chunk.text,
-                "token_count": chunk.token_count,
                 "start_index": chunk.start_index,
                 "end_index": chunk.end_index,
-                "metadata": {  # Attach file-level metadata
-                    "file_id": metadata.get("file_id"),
-                    "filename": metadata.get("filename"),
-                    # Add more, e.g., map indices to pages if needed
+                "token_count": chunk.token_count,
+                "metadata": {
+                    "file_id": meta.get("file_id"),  # Your GUID
+                    "filename": meta.get("filename"),
+                    "subfolder": meta.get("subfolder"),
+                    "DateReviewed": meta.get("DateReviewed"),
+                    "DateNext": meta.get("DateNext"),
+                    "last_modified_iso": meta.get("last_modified_iso"),
+                    # Add more as needed
                 }
-            })
-        
-        logger.info(f"Chunking complete: {len(enriched_chunks)} chunks generated.")
+            }
+            enriched_chunks.append(enriched)
         return enriched_chunks
-    
     except Exception as e:
-        logger.error(f"Chunking failed: {e}", exc_info=True)
-        return []  # Return empty list on failure to not crash the endpoint
+        logger.error(f"Chunking/embedding failed: {e}")
+        return []
 
 # ... (Your existing /docling/convert-all endpoint and app.run() remain the same)
 
