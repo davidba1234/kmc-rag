@@ -23,6 +23,7 @@ import pdfplumber
 import tempfile
 import zipfile
 from chonkie import SemanticChunker # type: ignore
+from docling.datamodel.pipeline_options import PictureDescriptionVlmOptions
 
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
@@ -726,12 +727,20 @@ def health():
     return jsonify({"status": "ok", "base_directory": BASE_DIR})
 
 # Docling configuration
+# Configure picture description with a VLM
+picture_desc_options = PictureDescriptionVlmOptions(
+    repo_id="microsoft/Florence-2-large",  # or another vision model
+    prompt="Describe this image from a document in detail. If it's a chart, graph, or diagram, explain what it shows and any key data points.",
+)
+
 pdf_opts = PdfPipelineOptions(
     do_ocr=True,
     do_table_structure=True,
     table_structure_options=TableStructureOptions(
         mode=TableFormerMode.ACCURATE
-    )
+    ),
+    # Add picture description options
+    picture_description_options=picture_desc_options
 )
 
 docling_converter = DocumentConverter(
