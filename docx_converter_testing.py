@@ -23,6 +23,15 @@ import pdfplumber
 import tempfile
 import zipfile
 from chonkie import SemanticChunker # type: ignore
+import hashlib
+from io import BytesIO
+try:
+    from PIL import Image  # for thumbnails
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
+
 
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
@@ -68,6 +77,10 @@ ALL_METADATA_FIELDS = [
     "ai_title",
     "ai_description"
 ]
+
+def get_image_descriptions_from_api(image_info_list):
+    # No-op stub: image analysis handled by /docling/convert-file two-step flow.
+    return []
 
 # --- Helper Functions ---
 
@@ -542,6 +555,165 @@ def perform_chunking(input_text, complete_metadata, options):
         logger.error(f"Chunking failed: {e}")
         return []
 
+def _make_thumb_b64(image_bytes: bytes, thumb_px: int = 256) -> str:
+    """
+    Returns a data-URI base64 thumbnail. Uses Pillow if available; otherwise returns
+    a JPEG-compressed preview from the original bytes (best-effort).
+    """
+    try:
+        if PIL_AVAILABLE:
+            with Image.open(BytesIO(image_bytes)) as im:
+                im = im.convert("RGB")
+                im.thumbnail((thumb_px, thumb_px), Image.LANCZOS)
+                out = BytesIO()
+                im.save(out, format="JPEG", quality=80, optimize=True)
+                b64 = base64.b64encode(out.getvalue()).decode("utf-8")
+                return f"data:image/jpeg;base64,{b64}"
+        # Fallback: just base64 the original (can be large)
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        return f"data:image/{'jpeg'};base64,{b64}"
+    except Exception:
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        return f"data:image/{'jpeg'};base64,{b64}"
+
+def build_pdf_image_manifest(pdf_path: str, guid: str,
+                             min_area: int = 12000,
+                             max_images: int = 150,
+                             thumb_px: int = 256) -> list[dict]:
+    """
+    Scans PDF images and returns a manifest with small thumbnails and metadata.
+    Does not persist full images to disk; we re-extract for selected items later.
+    """
+    manifest = []
+    try:
+        doc = fitz.open(pdf_path)
+        for page_idx in range(len(doc)):
+            page = doc[page_idx]
+            for img in page.get_images(full=True):
+                xref = img[0]
+                width, height = img[2], img[3]
+                area = (width or 0) * (height or 0)
+                if area < min_area:
+                    continue
+                try:
+                    base_image = doc.extract_image(xref)
+                except Exception:
+                    continue
+                image_bytes = base_image.get("image", b"")
+                ext = base_image.get("ext", "png")
+                size_bytes = len(image_bytes)
+                thumb_b64 = _make_thumb_b64(image_bytes, thumb_px=thumb_px)
+                entry_id = f"{guid}:{page_idx+1}:{xref}"
+                manifest.append({
+                    "id": entry_id,
+                    "page": page_idx + 1,
+                    "xref": xref,
+                    "width": width,
+                    "height": height,
+                    "size_bytes": size_bytes,
+                    "ext": ext,
+                    "thumb_b64": thumb_b64
+                })
+                if len(manifest) >= max_images:
+                    break
+            if len(manifest) >= max_images:
+                break
+        doc.close()
+    except Exception as e:
+        logger.error(f"build_pdf_image_manifest error for {pdf_path}: {e}", exc_info=True)
+    return manifest
+
+def _selection_state_path(token: str) -> str:
+    return os.path.join(JSON_CACHE_DIR, f"image_selection_{token}.json")
+
+def save_selection_state(token: str, state: dict) -> None:
+    try:
+        with open(_selection_state_path(token), "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to save selection state: {e}")
+
+def load_selection_state(token: str) -> dict | None:
+    try:
+        with open(_selection_state_path(token), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def describe_selected_images_with_openai(pdf_path: str,
+                                         selection_state: dict,
+                                         selected_ids: list[str],
+                                         model: str = "gpt-4o-mini",
+                                         per_image_max_tokens: int = 250,
+                                         sleep_sec: float = 0.0) -> list[dict]:
+    """
+    Calls OpenAI Vision only for selected ids.
+    Returns list of {id, page, description}.
+    """
+    try:
+        client = OpenAI()
+    except Exception as e:
+        logger.error(f"OpenAI client failed. Is OPENAI_API_KEY set? {e}")
+        return []
+
+    id_to_info = {e["id"]: e for e in selection_state.get("manifest", [])}
+    results = []
+    try:
+        doc = fitz.open(pdf_path)
+        for sel_id in selected_ids:
+            info = id_to_info.get(sel_id)
+            if not info:
+                continue
+            page = info.get("page")
+            xref = info.get("xref")
+            try:
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image.get("image", b"")
+                b64 = base64.b64encode(image_bytes).decode("utf-8")
+                prompt = (
+                    "You are analyzing an image extracted from a PDF document. "
+                    "Provide a precise, 1–3 sentence description tailored for retrieval. "
+                    "If it is a chart/graph, state title (if visible), axes/units, key trend(s), and any standout values. "
+                    "If it is a table/diagram/photo/illustration, summarize what it conveys. "
+                    "Do not speculate beyond visible content."
+                )
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                        ]
+                    }],
+                    temperature=0.2,
+                    max_tokens=per_image_max_tokens
+                )
+                desc = (resp.choices[0].message.content or "").strip()
+                results.append({"id": sel_id, "page": page, "description": desc})
+                if sleep_sec:
+                    time.sleep(sleep_sec)
+            except Exception as e:
+                logger.warning(f"Vision call failed for image id={sel_id}: {e}")
+        doc.close()
+    except Exception as e:
+        logger.error(f"Failed to open PDF for vision extraction: {e}", exc_info=True)
+    return results
+
+def append_image_descriptions_to_markdown(markdown_text: str, image_descs: list[dict]) -> str:
+    if not image_descs:
+        return markdown_text
+    lines = []
+    lines.append(markdown_text)
+    lines.append("\n\n---\n### Image descriptions\n")
+    # Sort by page then id for stable output
+    for item in sorted(image_descs, key=lambda x: (x.get("page", 0), x.get("id", ""))):
+        page = item.get("page")
+        desc = item.get("description", "").strip()
+        if desc:
+            lines.append(f"- Page {page}: {desc}")
+    return "\n".join(lines)
+
 # --- API Endpoints ---
 
 @app.route('/ensure-guids', methods=['POST'])
@@ -752,6 +924,11 @@ def docling_convert_file():
         do_chunking = data.get("do_chunking", False)
         chunking_options = data.get("chunking_options", {})
 
+        # New image-selection params
+        image_mode = data.get("image_mode", "ask")  # "ask" | "selected" | "skip"
+        selection_token = data.get("selection_token")
+        selected_image_ids = data.get("selected_image_ids", []) or []
+
         if not os.path.exists(file_path):
             return jsonify({"error": f"File not found: {file_path}"}), 404
         if not os.path.abspath(file_path).startswith(os.path.abspath(BASE_DIR)):
@@ -785,24 +962,19 @@ def docling_convert_file():
 
         logger.info(f"convert-file: {file_path} selected converter = {'docling' if use_docling else 'native'}")
 
-        # Native lightweight docx path
+        # Native lightweight docx path (unchanged)
         if ext == '.docx' and not use_docling:
             content = docx_to_json(file_path)
             if "error" in content:
                 return jsonify({"error": content["error"]}), 500
 
             date_reviewed, date_next = extract_custom_metadata(file_path)
-            
-            # Build full text first
             full_text = "\n\n".join(content.get("paragraphs", []))
-
-            # Generate AI title/description
             ai_title, ai_description = generate_ai_title_description(
                 full_text,
                 os.path.basename(file_path),
             )
 
-            # Create complete metadata with all fields
             extra_data = {
                 "file_id": guid,
                 "paragraph_count": len(content.get("paragraphs", [])),
@@ -815,11 +987,12 @@ def docling_convert_file():
                 "DateNext": date_next,
                 "ai_title": ai_title,
                 "ai_description": ai_description,
+                "image_count_total": 0,
+                "image_count_selected": 0,
+                "image_count_analyzed": 0,
             }
-            
             complete_metadata = make_complete_metadata(file_path, extra_data)
 
-            # Chunking if requested
             chunks = []
             if do_chunking:
                 chunks = perform_chunking(full_text, complete_metadata, chunking_options)
@@ -835,75 +1008,153 @@ def docling_convert_file():
                     "tables": content.get("tables"),
                     "metadata": content.get("metadata")
                 },
-                "metadata": complete_metadata,  # All fields always included
+                "metadata": complete_metadata,
                 "chunks": chunks
             })
 
-        # Docling path (for PDFs and complex DOCX)
+        # DOC LING path for PDFs and complex DOCX
         logger.info("Running Docling converter...")
         conversion_result = docling_converter.convert(file_path)
-        
         document = conversion_result.document
         document_dict = document.export_to_dict()
-        
-        # Custom metadata
+        full_text_md = document.export_to_markdown()
+
+        # Custom metadata for DOCX
         extra_meta = {}
         if ext == ".docx":
             date_reviewed, date_next = extract_custom_metadata(file_path)
             extra_meta.update({"DateReviewed": date_reviewed, "DateNext": date_next})
-        
-        full_text = document.export_to_markdown()
-        
-        # Generate AI title/description
+
+        # If PDF and image_mode == "ask", first return manifest for user selection
+        image_manifest = []
+        selection_state = None
+        image_descs = []
+
+        if ext == ".pdf":
+            if image_mode == "ask":
+                image_manifest = build_pdf_image_manifest(file_path, guid)
+                token_seed = f"{guid}:{file_path}:{time.time()}:{len(image_manifest)}"
+                token = hashlib.sha256(token_seed.encode("utf-8")).hexdigest()[:32]
+                selection_state = {
+                    "file_path": file_path,
+                    "guid": guid,
+                    "manifest": image_manifest,
+                    "created_at": datetime.utcnow().isoformat() + "Z"
+                }
+                save_selection_state(token, selection_state)
+                # Return manifest for UI to choose images
+                return jsonify({
+                    "success": True,
+                    "used_converter": "docling",
+                    "needs_image_selection": True,
+                    "message": "Select which images to analyze and POST back using image_mode='selected'.",
+                    "file_path": file_path,
+                    "filename": os.path.basename(file_path),
+                    "conversion_status": str(conversion_result.status),
+                    "image_manifest": image_manifest,
+                    "selection_token": token
+                })
+
+            elif image_mode == "selected":
+                # Validate selection token/state
+                if not selection_token:
+                    return jsonify({"error": "selection_token is required when image_mode='selected'"}), 400
+                selection_state = load_selection_state(selection_token)
+                if not selection_state or selection_state.get("file_path") != file_path:
+                    return jsonify({"error": "Invalid or expired selection_token for this file_path"}), 400
+                # Analyze only selected images
+                image_descs = describe_selected_images_with_openai(
+                    file_path=file_path,
+                    selection_state=selection_state,
+                    selected_ids=selected_image_ids,
+                    model=data.get("vision_model", "gpt-4o-mini"),
+                    per_image_max_tokens=int(data.get("vision_max_tokens", 250)),
+                    sleep_sec=float(data.get("vision_sleep_sec", 0.0))
+                )
+                # Merge image descriptions into markdown
+                full_text_md = append_image_descriptions_to_markdown(full_text_md, image_descs)
+            else:
+                # image_mode == "skip": do nothing
+                pass
+
+        # Generate AI title/description on the final text (with image descriptions if any)
         ai_title, ai_description = generate_ai_title_description(
-            full_text,
+            full_text_md,
             Path(file_path).name,
         )
-        
-        # Get origin meta from docling and normalize
-        origin_meta_raw = document_dict.get("origin", {})
-        if isinstance(origin_meta_raw, dict):
-            origin_meta = origin_meta_raw
-        else:
-            origin_meta = {"origin": str(origin_meta_raw)} if origin_meta_raw else {}
-        
-        # Create complete metadata with all fields
+
+        # Compose metadata
+        image_count_total = len(selection_state["manifest"]) if selection_state else 0
+        image_count_selected = len(selected_image_ids) if selected_image_ids else 0
+        image_count_analyzed = len(image_descs) if image_descs else 0
+
         extra_data = {
             "file_id": guid,
-            "paragraph_count": full_text.count('\n\n') + 1,  # Rough estimate
+            "paragraph_count": full_text_md.count('\n\n') + 1,
             "table_count": len(document_dict.get("tables", [])),
-            "word_count": len(full_text.split()),
-            "character_count": len(full_text),
+            "word_count": len(full_text_md.split()),
+            "character_count": len(full_text_md),
             "has_guid": bool(guid),
             "guid_source": guid_source,
             "ai_title": ai_title,
             "ai_description": ai_description,
+            "image_count_total": image_count_total,
+            "image_count_selected": image_count_selected,
+            "image_count_analyzed": image_count_analyzed,
             **extra_meta,
-            **origin_meta,
         }
-        
+        # Include docling origin metadata if present
+        origin_meta_raw = document_dict.get("origin", {})
+        if isinstance(origin_meta_raw, dict):
+            extra_data.update(origin_meta_raw)
+        elif origin_meta_raw:
+            extra_data["origin"] = str(origin_meta_raw)
+
         complete_metadata = make_complete_metadata(file_path, extra_data)
-        
-        # Chunking if requested
+
+        # Optional chunking
         chunks = []
         if do_chunking:
-            chunks = perform_chunking(full_text, complete_metadata, chunking_options)
+            chunks = perform_chunking(full_text_md, complete_metadata, chunking_options)
 
-        return jsonify({
+        # Build response
+        resp = {
             "success": True,
             "used_converter": "docling",
             "file_path": file_path,
             "filename": os.path.basename(file_path),
             "conversion_status": str(conversion_result.status),
             "document": document_dict,
-            "full_text": full_text,
-            "metadata": complete_metadata,  # All fields always included
+            "full_text": full_text_md,
+            "metadata": complete_metadata,
             "chunks": chunks
-        })
+        }
+        # If we analyzed images, return both the manifest (for reference) and descriptions
+        if selection_state:
+            resp["image_manifest"] = selection_state.get("manifest", [])
+        if image_descs:
+            resp["image_descriptions"] = image_descs
+
+        return jsonify(resp)
 
     except Exception as e:
         logger.error(f"Error processing file with Docling/native: {e}", exc_info=True)
         return jsonify({"error": f"Error processing file: {str(e)}"}), 500
+
+@app.route('/image-selection/get', methods=['GET'])
+def image_selection_get():
+    token = request.args.get('token')
+    if not token:
+        return jsonify({"error": "missing token"}), 400
+    state = load_selection_state(token)
+    if not state:
+        return jsonify({"error": "invalid or expired token"}), 404
+    return jsonify({
+        "file_path": state.get("file_path"),
+        "guid": state.get("guid"),
+        "image_manifest": state.get("manifest", []),
+        "created_at": state.get("created_at")
+    })
 
 @app.route('/docling/convert-all', methods=['POST'])
 def docling_convert_all():
