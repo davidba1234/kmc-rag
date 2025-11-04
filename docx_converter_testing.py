@@ -16,16 +16,13 @@ import base64  # To encode images for API call
 from openai import OpenAI # To call the vision model
 from docling.document_converter import DocumentConverter, PdfFormatOption, WordFormatOption
 from docling.datamodel.pipeline_options import (
-    PdfPipelineOptions, TableStructureOptions, TableFormerMode, PictureDescriptionVlmOptions, 
+    PdfPipelineOptions, TableStructureOptions, TableFormerMode
 )
-from docling_core.types.doc import ImageRefMode, PictureItem
 from docling.datamodel.base_models import InputFormat
 import pdfplumber
 import tempfile
 import zipfile
 from chonkie import SemanticChunker # type: ignore
-import threading
-
 
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
@@ -46,11 +43,6 @@ BASE_DIR = r"C:\\Users\\ander\\Documents\\n8n\\test_docs"
 JSON_CACHE_DIR = os.path.join(BASE_DIR, "json_cache")
 IMAGE_OUTPUT_DIR = os.path.join(BASE_DIR, "image_output")
 os.makedirs(JSON_CACHE_DIR, exist_ok=True)
-
-try:
-    BACKGROUND_JOBS
-except NameError:
-    BACKGROUND_JOBS = {}
 
 SUPPORTED_EXTENSIONS = ['.docx', '.pdf']
 
@@ -550,235 +542,6 @@ def perform_chunking(input_text, complete_metadata, options):
         logger.error(f"Chunking failed: {e}")
         return []
 
-def _gather_docling_picture_image_info(document, out_dir):
-    """
-    Returns a list of {"path": <image_path>, "page": <int or None>} for PictureItem(s)
-    Tries to use paths Docling created (because generate_picture_images=True),
-    and falls back to bytes if available.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    results = []
-    idx = 0
-    for item, _lvl in document.iterate_items():
-        if not isinstance(item, PictureItem):
-            continue
-
-        # Prefer existing file path emitted by Docling
-        candidate_path = None
-        for attr in ("image_path", "image_file", "path", "file_path"):
-            p = getattr(item, attr, None)
-            if isinstance(p, str) and os.path.exists(p):
-                candidate_path = p
-                break
-
-        # Fall back to extracting bytes if available
-        if not candidate_path:
-            img_bytes = None
-            for a in ("get_image_bytes", "image_bytes", "get_image"):
-                m = getattr(item, a, None)
-                if callable(m):
-                    try:
-                        b = m()
-                        if isinstance(b, (bytes, bytearray)):
-                            img_bytes = bytes(b)
-                            break
-                        # Handle PIL.Image return
-                        if hasattr(b, "save"):
-                            buf = io.BytesIO()
-                            try:
-                                b.save(buf, format="JPEG")
-                                img_bytes = buf.getvalue()
-                                break
-                            except Exception:
-                                pass
-                    except Exception:
-                        continue
-            if img_bytes:
-                candidate_path = os.path.join(out_dir, f"docling_img_{idx}.jpg")
-                with open(candidate_path, "wb") as f:
-                    f.write(img_bytes)
-
-        if candidate_path and os.path.exists(candidate_path):
-            results.append({
-                "path": candidate_path,
-                "page": getattr(item, "page", None)
-            })
-            idx += 1
-
-    return results
-
-def _inject_descriptions_into_markdown(document, descriptions):
-    """
-    Export markdown with placeholders and interleave [Image Description: ...] at each <!-- image -->.
-    """
-    md_with_ph = document.export_to_markdown(image_mode=ImageRefMode.PLACEHOLDER)
-    parts = md_with_ph.split("<!-- image -->")
-    if len(parts) == 1:
-        # No placeholders; append descriptions at the end
-        tail = "\n".join(f"[Image Description: {d or 'Image'}]" for d in descriptions)
-        return md_with_ph + ("\n" + tail if tail else "")
-
-    out = [parts[0]]
-    for i in range(1, len(parts)):
-        d = descriptions[i-1] if (i-1) < len(descriptions) else "Image"
-        out.append(f"[Image Description: {d or 'Image'}]")
-        out.append(parts[i])
-    return "".join(out)
-
-def _make_guid_for_file(file_path, ext):
-    """Match your existing GUID logic."""
-    if ext == ".pdf":
-        guid = get_or_create_pdf_guid(file_path)
-        source = "pdf_metadata"
-    elif ext == ".docx":
-        guid = extract_docx_guid(file_path)
-        if guid:
-            source = "docx_settings"
-        else:
-            stem = os.path.splitext(os.path.basename(file_path))[0]
-            guid = stem.replace(' ', '_').replace('-', '_').lower()
-            source = "filename_fallback"
-    else:
-        guid, source = None, "unknown"
-    return guid, source
-
-def _docling_convert_worker(job_id, file_path, force_refresh=False, do_chunking=False, chunking_options=None):
-    """
-    Background worker for /docling/convert-file.
-    Produces the same-shaped JSON you return today, but uses OpenAI for image descriptions.
-    """
-    BACKGROUND_JOBS[job_id]["status"] = "running"
-    BACKGROUND_JOBS[job_id]["started_at"] = time.time()
-    chunking_options = chunking_options or {}
-    try:
-        ext = os.path.splitext(file_path)[1].lower()
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"File not found: {file_path}")
-
-        # GUID + source (same semantics as your current route)
-        guid, guid_source = _make_guid_for_file(file_path, ext)
-
-        # Decide converter (align with your current logic)
-        use_docling = (ext == ".pdf") or (ext == ".docx" and is_docx_complex(file_path))
-        logger.info(f"[job {job_id}] converter = {'docling' if use_docling else 'native_docx'} for {file_path}")
-
-        # Native DOCX path (unchanged semantics)
-        if ext == ".docx" and not use_docling:
-            content = docx_to_json(file_path)
-            if "error" in content:
-                raise RuntimeError(content["error"])
-
-            full_text = "\n\n".join(content.get("paragraphs", []))
-            ai_title, ai_description = generate_ai_title_description(full_text, os.path.basename(file_path))
-
-            extra_data = {
-                "file_id": guid,
-                "paragraph_count": len(content.get("paragraphs", [])),
-                "table_count": len(content.get("tables", [])),
-                "word_count": len(full_text.split()),
-                "character_count": len(full_text),
-                "has_guid": bool(guid),
-                "guid_source": guid_source,
-                "DateReviewed": content.get("metadata", {}).get("DateReviewed"),
-                "DateNext": content.get("metadata", {}).get("DateNext"),
-                "ai_title": ai_title,
-                "ai_description": ai_description,
-            }
-            complete_metadata = make_complete_metadata(file_path, extra_data)
-
-            chunks = perform_chunking(full_text, complete_metadata, chunking_options) if do_chunking else []
-
-            BACKGROUND_JOBS[job_id]["status"] = "done"
-            BACKGROUND_JOBS[job_id]["finished_at"] = time.time()
-            BACKGROUND_JOBS[job_id]["result"] = {
-                "success": True,
-                "used_converter": "native_docx",
-                "file_path": file_path,
-                "filename": content.get("filename"),
-                "full_text": full_text,
-                "structured_content": {
-                    "paragraphs": content.get("paragraphs"),
-                    "tables": content.get("tables"),
-                    "metadata": content.get("metadata")
-                },
-                "metadata": complete_metadata,
-                "chunks": chunks
-            }
-            return
-
-        # Docling path (PDFs + complex DOCX) with OpenAI descriptions
-        # 1) Make sure local VLM is OFF and images are generated
-        try:
-            pdf_opts.do_picture_description = False
-            pdf_opts.generate_picture_images = True
-        except Exception:
-            pass  # if options are immutable, rely on how you constructed docling_converter
-
-        conversion_result = docling_converter.convert(file_path)
-        document = conversion_result.document
-        document_dict = document.export_to_dict()
-
-        # 2) Gather image files Docling produced and call your OpenAI describer
-        img_out_dir = os.path.join(IMAGE_OUTPUT_DIR, guid or "no_guid", "openai_img_desc")
-        image_info_list = _gather_docling_picture_image_info(document, img_out_dir)
-        logger.info(f"[job {job_id}] pictures found: {len(image_info_list)}")
-
-        image_descriptions = get_image_descriptions_from_api(image_info_list) if image_info_list else []
-        desc_texts = []
-        for r in image_descriptions:
-            d = r.get("description")
-            # r['description'] can be a dict/structured for chat; ensure string
-            if isinstance(d, str):
-                desc_texts.append(d.strip())
-            else:
-                desc_texts.append(str(d) if d is not None else "Image")
-
-        # 3) Inject descriptions into markdown placeholders
-        full_text = _inject_descriptions_into_markdown(document, desc_texts)
-
-        # 4) AI title/description and metadata
-        ai_title, ai_description = generate_ai_title_description(full_text, os.path.basename(file_path))
-
-        # origin meta from docling
-        origin_meta_raw = document_dict.get("origin", {})
-        origin_meta = origin_meta_raw if isinstance(origin_meta_raw, dict) else {"origin": str(origin_meta_raw)} if origin_meta_raw else {}
-
-        extra_data = {
-            "file_id": guid,
-            "paragraph_count": full_text.count('\n\n') + 1,
-            "table_count": len(document_dict.get("tables", [])),
-            "word_count": len(full_text.split()),
-            "character_count": len(full_text),
-            "has_guid": bool(guid),
-            "guid_source": guid_source,
-            "ai_title": ai_title,
-            "ai_description": ai_description,
-            **origin_meta
-        }
-        complete_metadata = make_complete_metadata(file_path, extra_data)
-
-        chunks = perform_chunking(full_text, complete_metadata, chunking_options) if do_chunking else []
-
-        # 5) Store result
-        BACKGROUND_JOBS[job_id]["status"] = "done"
-        BACKGROUND_JOBS[job_id]["finished_at"] = time.time()
-        BACKGROUND_JOBS[job_id]["result"] = {
-            "success": True,
-            "used_converter": "docling",
-            "file_path": file_path,
-            "filename": os.path.basename(file_path),
-            "conversion_status": str(conversion_result.status),
-            "document": document_dict,
-            "full_text": full_text,
-            "metadata": complete_metadata,
-            "chunks": chunks
-        }
-
-    except Exception as e:
-        logger.exception(f"[job {job_id}] docling conversion failed")
-        BACKGROUND_JOBS[job_id]["status"] = "error"
-        BACKGROUND_JOBS[job_id]["finished_at"] = time.time()
-        BACKGROUND_JOBS[job_id]["result"] = {"success": False, "error": str(e)}
 # --- API Endpoints ---
 
 @app.route('/ensure-guids', methods=['POST'])
@@ -963,21 +726,13 @@ def health():
     return jsonify({"status": "ok", "base_directory": BASE_DIR})
 
 # Docling configuration
-# Configure picture description with a VLM
-picture_desc_options = PictureDescriptionVlmOptions(
-    repo_id="HuggingFaceTB/SmolVLM-256M-Instruct",
-    prompt="Describe this document image concisely. If a chart/table/diagram, explain key points."
-)
-
 pdf_opts = PdfPipelineOptions(
     do_ocr=True,
     do_table_structure=True,
-    table_structure_options=TableStructureOptions(mode=TableFormerMode.ACCURATE),
-    picture_description_options=picture_desc_options
+    table_structure_options=TableStructureOptions(
+        mode=TableFormerMode.ACCURATE
+    )
 )
-pdf_opts.do_picture_description = True
-pdf_opts.generate_picture_images = True
-pdf_opts.images_scale = 2.0
 
 docling_converter = DocumentConverter(
     format_options={
@@ -986,72 +741,170 @@ docling_converter = DocumentConverter(
     }
 )
 
-
 @app.route('/docling/convert-file', methods=['POST'])
 def docling_convert_file():
-    """
-    Start a background conversion job that:
-    - Runs Docling (or native DOCX for simple docs)
-    - Disables local VLM and uses OpenAI image descriptions
-    - Injects descriptions at <!-- image --> placeholders
-    Returns: 202 with job_id and status URL to poll.
-    """
     try:
         data = request.get_json(force=True)
-    except Exception:
-        return jsonify({"error": "Invalid JSON body"}), 400
+        if not data or 'file_path' not in data:
+            return jsonify({"error": "Missing 'file_path' in JSON request body"}), 400
+        file_path = data['file_path']
+        force_refresh = data.get("force_refresh", False)
+        do_chunking = data.get("do_chunking", False)
+        chunking_options = data.get("chunking_options", {})
 
-    file_path = (data or {}).get("file_path")
-    force_refresh = (data or {}).get("force_refresh", False)
-    do_chunking = (data or {}).get("do_chunking", False)
-    chunking_options = (data or {}).get("chunking_options", {})
+        if not os.path.exists(file_path):
+            return jsonify({"error": f"File not found: {file_path}"}), 404
+        if not os.path.abspath(file_path).startswith(os.path.abspath(BASE_DIR)):
+            return jsonify({"error": "File path is outside allowed directory"}), 403
 
-    if not file_path:
-        return jsonify({"error": "Missing 'file_path'"}), 400
-    if not os.path.exists(file_path):
-        return jsonify({"error": f"File not found: {file_path}"}), 404
-    if not os.path.abspath(file_path).startswith(os.path.abspath(BASE_DIR)):
-        return jsonify({"error": "File path is outside allowed directory"}), 403
+        ext = os.path.splitext(file_path)[1].lower()
 
-    job_id = str(uuid.uuid4())
-    BACKGROUND_JOBS[job_id] = {
-        "status": "pending",
-        "created_at": time.time(),
-        "params": {
+        # Get GUID
+        guid = None
+        guid_source = "unknown"
+        if ext == '.pdf':
+            guid = get_or_create_pdf_guid(file_path)
+            guid_source = "pdf_metadata"
+        elif ext == '.docx':
+            guid = extract_docx_guid(file_path)
+            if guid:
+                guid_source = "docx_settings"
+            else:
+                filename_without_ext = os.path.splitext(os.path.basename(file_path))[0]
+                guid = filename_without_ext.replace(' ', '_').replace('-', '_').lower()
+                guid_source = "filename_fallback"
+
+        # Decide converter
+        use_docling = False
+        if ext == '.pdf':
+            use_docling = True
+        elif ext == '.docx':
+            use_docling = is_docx_complex(file_path)
+        else:
+            return jsonify({"error": f"Unsupported file type: {ext}"}), 400
+
+        logger.info(f"convert-file: {file_path} selected converter = {'docling' if use_docling else 'native'}")
+
+        # Native lightweight docx path
+        if ext == '.docx' and not use_docling:
+            content = docx_to_json(file_path)
+            if "error" in content:
+                return jsonify({"error": content["error"]}), 500
+
+            date_reviewed, date_next = extract_custom_metadata(file_path)
+            
+            # Build full text first
+            full_text = "\n\n".join(content.get("paragraphs", []))
+
+            # Generate AI title/description
+            ai_title, ai_description = generate_ai_title_description(
+                full_text,
+                os.path.basename(file_path),
+            )
+
+            # Create complete metadata with all fields
+            extra_data = {
+                "file_id": guid,
+                "paragraph_count": len(content.get("paragraphs", [])),
+                "table_count": len(content.get("tables", [])),
+                "word_count": len(full_text.split()),
+                "character_count": len(full_text),
+                "has_guid": bool(guid),
+                "guid_source": guid_source,
+                "DateReviewed": date_reviewed,
+                "DateNext": date_next,
+                "ai_title": ai_title,
+                "ai_description": ai_description,
+            }
+            
+            complete_metadata = make_complete_metadata(file_path, extra_data)
+
+            # Chunking if requested
+            chunks = []
+            if do_chunking:
+                chunks = perform_chunking(full_text, complete_metadata, chunking_options)
+
+            return jsonify({
+                "success": True,
+                "used_converter": "native_docx",
+                "file_path": file_path,
+                "filename": content.get("filename"),
+                "full_text": full_text,
+                "structured_content": {
+                    "paragraphs": content.get("paragraphs"),
+                    "tables": content.get("tables"),
+                    "metadata": content.get("metadata")
+                },
+                "metadata": complete_metadata,  # All fields always included
+                "chunks": chunks
+            })
+
+        # Docling path (for PDFs and complex DOCX)
+        logger.info("Running Docling converter...")
+        conversion_result = docling_converter.convert(file_path)
+        
+        document = conversion_result.document
+        document_dict = document.export_to_dict()
+        
+        # Custom metadata
+        extra_meta = {}
+        if ext == ".docx":
+            date_reviewed, date_next = extract_custom_metadata(file_path)
+            extra_meta.update({"DateReviewed": date_reviewed, "DateNext": date_next})
+        
+        full_text = document.export_to_markdown()
+        
+        # Generate AI title/description
+        ai_title, ai_description = generate_ai_title_description(
+            full_text,
+            Path(file_path).name,
+        )
+        
+        # Get origin meta from docling and normalize
+        origin_meta_raw = document_dict.get("origin", {})
+        if isinstance(origin_meta_raw, dict):
+            origin_meta = origin_meta_raw
+        else:
+            origin_meta = {"origin": str(origin_meta_raw)} if origin_meta_raw else {}
+        
+        # Create complete metadata with all fields
+        extra_data = {
+            "file_id": guid,
+            "paragraph_count": full_text.count('\n\n') + 1,  # Rough estimate
+            "table_count": len(document_dict.get("tables", [])),
+            "word_count": len(full_text.split()),
+            "character_count": len(full_text),
+            "has_guid": bool(guid),
+            "guid_source": guid_source,
+            "ai_title": ai_title,
+            "ai_description": ai_description,
+            **extra_meta,
+            **origin_meta,
+        }
+        
+        complete_metadata = make_complete_metadata(file_path, extra_data)
+        
+        # Chunking if requested
+        chunks = []
+        if do_chunking:
+            chunks = perform_chunking(full_text, complete_metadata, chunking_options)
+
+        return jsonify({
+            "success": True,
+            "used_converter": "docling",
             "file_path": file_path,
-            "force_refresh": force_refresh,
-            "do_chunking": do_chunking,
-            "chunking_options": chunking_options
-        },
-        "result": None
-    }
+            "filename": os.path.basename(file_path),
+            "conversion_status": str(conversion_result.status),
+            "document": document_dict,
+            "full_text": full_text,
+            "metadata": complete_metadata,  # All fields always included
+            "chunks": chunks
+        })
 
-    t = threading.Thread(
-        target=_docling_convert_worker,
-        args=(job_id, file_path, force_refresh, do_chunking, chunking_options),
-        daemon=True
-    )
-    t.start()
+    except Exception as e:
+        logger.error(f"Error processing file with Docling/native: {e}", exc_info=True)
+        return jsonify({"error": f"Error processing file: {str(e)}"}), 500
 
-    return jsonify({
-        "job_id": job_id,
-        "status": "queued",
-        "status_url": f"/docling/convert-status/{job_id}"
-    }), 202
-
-@app.route('/docling/convert-status/<job_id>', methods=['GET'])
-def docling_convert_status(job_id):
-    job = BACKGROUND_JOBS.get(job_id)
-    if not job:
-        return jsonify({"error": "job_id not found"}), 404
-    return jsonify({
-        "job_id": job_id,
-        "status": job.get("status"),
-        "created_at": job.get("created_at"),
-        "started_at": job.get("started_at"),
-        "finished_at": job.get("finished_at"),
-        "result": job.get("result")
-    }), 200
 @app.route('/docling/convert-all', methods=['POST'])
 def docling_convert_all():
     """Batch-convert all supported files under BASE_DIR using the Docling path."""
