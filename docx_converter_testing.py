@@ -1056,21 +1056,33 @@ def docling_convert_file():
                 })
 
             elif image_mode == "selected":
-                # Validate selection token/state
                 if not selection_token:
                     return jsonify({"error": "selection_token is required when image_mode='selected'"}), 400
                 selection_state = load_selection_state(selection_token)
                 if not selection_state or selection_state.get("file_path") != file_path:
                     return jsonify({"error": "Invalid or expired selection_token for this file_path"}), 400
-                # Analyze only selected images
-                image_descs = describe_selected_images_with_openai(
-                    file_path=file_path,
-                    selection_state=selection_state,
-                    selected_ids=selected_image_ids,
-                    model=data.get("vision_model", "gpt-4o-mini"),
-                    per_image_max_tokens=int(data.get("vision_max_tokens", 250)),
-                    sleep_sec=float(data.get("vision_sleep_sec", 0.0))
-                )
+
+            # >>> add this block (around line 723)
+                allowed_keys = {
+                    "pdf_path",
+                    "selection_state",
+                    "selected_ids",
+                    "model",
+                    "per_image_max_tokens",
+                    "sleep_sec",
+                }
+                describe_kwargs = {
+                    "pdf_path": file_path,
+                    "selection_state": selection_state,
+                    "selected_ids": selected_image_ids,
+                    "model": data.get("vision_model", "gpt-4o-mini"),
+                    "per_image_max_tokens": int(data.get("vision_max_tokens", 250)),
+                    "sleep_sec": float(data.get("vision_sleep_sec", 0.0)),
+                }
+                describe_kwargs = {k: v for k, v in describe_kwargs.items() if k in allowed_keys}
+           
+            # Analyze only selected images
+                image_descs = describe_selected_images_with_openai(**describe_kwargs)
                 # Merge image descriptions into markdown
                 full_text_md = append_image_descriptions_to_markdown(full_text_md, image_descs)
             else:
