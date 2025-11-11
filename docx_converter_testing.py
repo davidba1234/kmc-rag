@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 from flask import Flask, jsonify, request
 import os
 import json
@@ -32,9 +34,6 @@ except Exception:
     PIL_AVAILABLE = False
 
 
-
-os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
-
 # --- Basic Configuration ---
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +47,8 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-BASE_DIR = r"C:\\Users\\ander\\Documents\\n8n\\test_docs"
+BASE_DIR = "/mnt/c/Users/Anderson/Documents/n8n/kmc-rag/test_docs"
+print(f"BASE_DIR is set to: {BASE_DIR}")
 JSON_CACHE_DIR = os.path.join(BASE_DIR, "json_cache")
 IMAGE_OUTPUT_DIR = os.path.join(BASE_DIR, "image_output")
 os.makedirs(JSON_CACHE_DIR, exist_ok=True)
@@ -504,20 +504,32 @@ def convert_file_to_json(file_path):
 
 def find_all_supported_files():
     supported_files = []
-    for ext in SUPPORTED_EXTENSIONS:
-        pattern = os.path.join(BASE_DIR, "**", f"*{ext}")
-        for file_path in glob.glob(pattern, recursive=True):
-            if not os.path.basename(file_path).startswith('~$'):
-                file_stats = os.stat(file_path)
-                parent_dir = os.path.basename(os.path.dirname(file_path))
-                supported_files.append({
-                    "filename": os.path.basename(file_path),
-                    "full_path": file_path,
-                    "subfolder": parent_dir,
-                    "last_modified_iso": datetime.fromtimestamp(file_stats.st_mtime).isoformat()
-                })
+    
+    # Use os.walk for more reliable file discovery
+    for root, dirs, files in os.walk(BASE_DIR):
+        for filename in files:
+            # Skip temporary files
+            if filename.startswith('~$'):
+                continue
+                
+            # Check if file has supported extension (case-insensitive)
+            file_ext = os.path.splitext(filename)[1].lower()
+            if file_ext in [ext.lower() for ext in SUPPORTED_EXTENSIONS]:
+                file_path = os.path.join(root, filename)
+                try:
+                    file_stats = os.stat(file_path)
+                    parent_dir = os.path.basename(os.path.dirname(file_path))
+                    supported_files.append({
+                        "filename": filename,
+                        "full_path": file_path,
+                        "subfolder": parent_dir,
+                        "last_modified_iso": datetime.fromtimestamp(file_stats.st_mtime).isoformat()
+                    })
+                except OSError as e:
+                    logger.warning(f"Could not stat file {file_path}: {e}")
+                    continue
+    
     return supported_files
-
 def get_cache_path(file_path):
     filename_without_ext = os.path.splitext(os.path.basename(file_path))[0]
     parent_dir = os.path.basename(os.path.dirname(file_path))
@@ -715,6 +727,44 @@ def append_image_descriptions_to_markdown(markdown_text: str, image_descs: list[
     return "\n".join(lines)
 
 # --- API Endpoints ---
+
+
+@app.route('/debug-paths', methods=['GET'])
+def debug_paths():
+    return jsonify({
+        "BASE_DIR": BASE_DIR,
+        "BASE_DIR_exists": os.path.exists(BASE_DIR),
+        "BASE_DIR_absolute": os.path.abspath(BASE_DIR),
+        "files_in_base": os.listdir(BASE_DIR) if os.path.exists(BASE_DIR) else "Directory not found"
+    })
+
+@app.route('/debug-file-search', methods=['GET'])
+def debug_file_search():
+    debug_info = {
+        "BASE_DIR": BASE_DIR,
+        "BASE_DIR_exists": os.path.exists(BASE_DIR),
+        "SUPPORTED_EXTENSIONS": SUPPORTED_EXTENSIONS,
+        "search_results": {}
+    }
+    
+    for ext in SUPPORTED_EXTENSIONS:
+        pattern = os.path.join(BASE_DIR, "**", f"*{ext}")
+        files = glob.glob(pattern, recursive=True)
+        debug_info["search_results"][ext] = {
+            "pattern": pattern,
+            "files_found": files
+        }
+    
+    # Also try manual directory walk
+    manual_files = []
+    if os.path.exists(BASE_DIR):
+        for root, dirs, files in os.walk(BASE_DIR):
+            for file in files:
+                if any(file.lower().endswith(ext.lower()) for ext in SUPPORTED_EXTENSIONS):
+                    manual_files.append(os.path.join(root, file))
+    
+    debug_info["manual_walk_results"] = manual_files
+    return jsonify(debug_info)
 
 @app.route('/ensure-guids', methods=['POST'])
 def ensure_guids():
@@ -1188,5 +1238,4 @@ def docling_convert_all():
     return jsonify({"results": results, "count": len(results)})
 
 if __name__ == '__main__':
-    print("Starting Flask app...")
-    app.run(host='127.0.0.1', port=5001, debug=True)
+    app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=False)
