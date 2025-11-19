@@ -849,6 +849,248 @@ def docling_convert_file():
 
         ext = os.path.splitext(file_path)[1].lower()
 
+        # --- [1. COUNT IMAGES RAW (FAST)] ---
+        raw_total_images = 0
+        if ext == '.pdf':
+            try:
+                with fitz.open(file_path) as count_doc:
+                    for page in count_doc:
+                        raw_total_images += len(page.get_images(full=True))
+            except Exception as e:
+                logger.warning(f"Could not perform raw image count: {e}")
+
+        # --- [2. GET/CREATE GUID] ---
+        guid = None
+        guid_source = "unknown"
+        if ext == '.pdf':
+            guid = get_or_create_pdf_guid(file_path)
+            guid_source = "pdf_metadata"
+        elif ext == '.docx':
+            guid = extract_docx_guid(file_path)
+            if guid:
+                guid_source = "docx_settings"
+            else:
+                filename_without_ext = os.path.splitext(os.path.basename(file_path))[0]
+                guid = filename_without_ext.replace(' ', '_').replace('-', '_').lower()
+                guid_source = "filename_fallback"
+
+        # --- [3. DECIDE CONVERTER] ---
+        use_docling = False
+        if ext == '.pdf':
+            use_docling = True
+        elif ext == '.docx':
+            use_docling = is_docx_complex(file_path)
+        else:
+            return jsonify({"error": f"Unsupported file type: {ext}"}), 400
+
+        # ==================================================================
+        # [FAST PATH] IMAGE SCANNING (Moved BEFORE Docling Conversion)
+        # ==================================================================
+        if use_docling and ext == ".pdf" and image_mode == "ask":
+            logger.info(f"Fast scanning PDF for images: {file_path}")
+            # This uses fitz (PyMuPDF) which is instant compared to Docling
+            image_manifest = build_pdf_image_manifest(file_path, guid)
+            
+            if len(image_manifest) > 0:
+                token_seed = f"{guid}:{file_path}:{time.time()}:{len(image_manifest)}"
+                token = hashlib.sha256(token_seed.encode("utf-8")).hexdigest()[:32]
+                selection_state = {
+                    "file_path": file_path,
+                    "guid": guid,
+                    "manifest": image_manifest,
+                    "created_at": datetime.utcnow().isoformat() + "Z"
+                }
+                save_selection_state(token, selection_state)
+                
+                # RETURN IMMEDIATELY - Do not run Docling OCR yet
+                return jsonify({
+                    "success": True,
+                    "used_converter": "docling_fast_scan",
+                    "needs_image_selection": True,
+                    "message": "Images found. Select images and resubmit with image_mode='selected'.",
+                    "file_path": file_path,
+                    "filename": os.path.basename(file_path),
+                    "conversion_status": "pending_selection",
+                    "image_manifest": image_manifest,
+                    "selection_token": token,
+                    "total_images_detected": raw_total_images 
+                })
+            else:
+                logger.info("No images found during fast scan. Proceeding to auto-conversion.")
+                # If no images, we fall through to the standard heavy conversion below.
+
+        # ==================================================================
+        # [SLOW PATH] STANDARD CONVERSION (Native DOCX or Docling)
+        # ==================================================================
+
+        # [Path A: Native DOCX]
+        if ext == '.docx' and not use_docling:
+            # ... (Keep your existing native DOCX logic exactly as is) ...
+            content = docx_to_json(file_path)
+            if "error" in content:
+                return jsonify({"error": content["error"]}), 500
+            
+            # (Reconstruct metadata logic for native docx...)
+            date_reviewed, date_next = extract_custom_metadata(file_path)
+            full_text = "\n\n".join(content.get("paragraphs", []))
+            ai_title, ai_description = generate_ai_title_description(full_text, os.path.basename(file_path))
+            
+            extra_data = {
+                "file_id": guid,
+                "paragraph_count": len(content.get("paragraphs", [])),
+                "table_count": len(content.get("tables", [])),
+                "word_count": len(full_text.split()),
+                "character_count": len(full_text),
+                "has_guid": bool(guid),
+                "guid_source": guid_source,
+                "DateReviewed": date_reviewed,
+                "DateNext": date_next,
+                "ai_title": ai_title,
+                "ai_description": ai_description,
+                "image_count_total": 0,
+                "image_count_selected": 0,
+                "image_count_analyzed": 0,
+            }
+            complete_metadata = make_complete_metadata(file_path, extra_data)
+            chunks = []
+            if do_chunking:
+                chunks = perform_chunking(full_text, complete_metadata, chunking_options)
+
+            return jsonify({
+                "success": True,
+                "used_converter": "native_docx",
+                "file_path": file_path,
+                "filename": content.get("filename"),
+                "full_text": full_text,
+                "structured_content": {
+                    "paragraphs": content.get("paragraphs"),
+                    "tables": content.get("tables"),
+                    "metadata": content.get("metadata")
+                },
+                "metadata": complete_metadata,
+                "chunks": chunks
+            })
+
+        # [Path B: Heavy Docling Conversion]
+        # We only reach here if:
+        # 1. It's a complex DOCX
+        # 2. It's a PDF AND (image_mode='selected' OR image_mode='skip' OR image_mode='ask' but no images found)
+        
+        logger.info("Running Docling converter (Heavy Process)...")
+        conversion_result = docling_converter.convert(file_path)
+        document = conversion_result.document
+        document_dict = document.export_to_dict()
+        full_text_md = document.export_to_markdown()
+
+        extra_meta = {}
+        if ext == ".docx":
+            date_reviewed, date_next = extract_custom_metadata(file_path)
+            extra_meta.update({"DateReviewed": date_reviewed, "DateNext": date_next})
+
+        # Handle Image Mode = SELECTED
+        image_descs = []
+        selection_state = None
+        
+        if ext == ".pdf" and image_mode == "selected":
+            if not selection_token:
+                return jsonify({"error": "selection_token is required when image_mode='selected'"}), 400
+            
+            selection_state = load_selection_state(selection_token)
+            if not selection_state or selection_state.get("file_path") != file_path:
+                return jsonify({"error": "Invalid or expired selection_token"}), 400
+
+            allowed_keys = {"pdf_path", "selection_state", "selected_ids", "model", "per_image_max_tokens", "sleep_sec"}
+            describe_kwargs = {
+                "pdf_path": file_path,
+                "selection_state": selection_state,
+                "selected_ids": selected_image_ids,
+                "model": data.get("vision_model", "gpt-4o-mini"),
+                "per_image_max_tokens": int(data.get("vision_max_tokens", 250)),
+                "sleep_sec": float(data.get("vision_sleep_sec", 0.0)),
+            }
+            describe_kwargs = {k: v for k, v in describe_kwargs.items() if k in allowed_keys}
+        
+            # Analyze images
+            image_descs = describe_selected_images_with_openai(**describe_kwargs)
+            # Append descriptions to Markdown
+            full_text_md = append_image_descriptions_to_markdown(full_text_md, image_descs)
+
+        # Final Metadata & Response Construction
+        ai_title, ai_description = generate_ai_title_description(full_text_md, Path(file_path).name)
+
+        image_count_selected = len(selected_image_ids) if selected_image_ids else 0
+        image_count_analyzed = len(image_descs) if image_descs else 0
+
+        extra_data = {
+            "file_id": guid,
+            "paragraph_count": full_text_md.count('\n\n') + 1,
+            "table_count": len(document_dict.get("tables", [])),
+            "word_count": len(full_text_md.split()),
+            "character_count": len(full_text_md),
+            "has_guid": bool(guid),
+            "guid_source": guid_source,
+            "ai_title": ai_title,
+            "ai_description": ai_description,
+            "image_count_total": raw_total_images,
+            "image_count_selected": image_count_selected,
+            "image_count_analyzed": image_count_analyzed,
+            **extra_meta,
+        }
+
+        origin_meta_raw = document_dict.get("origin", {})
+        if isinstance(origin_meta_raw, dict):
+            extra_data.update(origin_meta_raw)
+        elif origin_meta_raw:
+            extra_data["origin"] = str(origin_meta_raw)
+
+        complete_metadata = make_complete_metadata(file_path, extra_data)
+        
+        chunks = []
+        if do_chunking:
+            chunks = perform_chunking(full_text_md, complete_metadata, chunking_options)
+
+        resp = {
+            "success": True,
+            "used_converter": "docling",
+            "file_path": file_path,
+            "filename": os.path.basename(file_path),
+            "conversion_status": str(conversion_result.status),
+            "document": document_dict,
+            "full_text": full_text_md,
+            "metadata": complete_metadata,
+            "chunks": chunks
+        }
+        if selection_state:
+            resp["image_manifest"] = selection_state.get("manifest", [])
+        if image_descs:
+            resp["image_descriptions"] = image_descs
+
+        return jsonify(resp)
+
+    except Exception as e:
+        logger.error(f"Error processing file: {e}", exc_info=True)
+        return jsonify({"error": f"Error processing file: {str(e)}"}), 500
+    try:
+        data = request.get_json(force=True)
+        if not data or 'file_path' not in data:
+            return jsonify({"error": "Missing 'file_path' in JSON request body"}), 400
+        file_path = data['file_path']
+        
+        # [Existing Params]
+        force_refresh = data.get("force_refresh", False)
+        do_chunking = data.get("do_chunking", False)
+        chunking_options = data.get("chunking_options", {})
+        image_mode = data.get("image_mode", "ask")
+        selection_token = data.get("selection_token")
+        selected_image_ids = data.get("selected_image_ids", []) or []
+
+        if not os.path.exists(file_path):
+            return jsonify({"error": f"File not found: {file_path}"}), 404
+        if not os.path.abspath(file_path).startswith(os.path.abspath(BASE_DIR)):
+            return jsonify({"error": "File path is outside allowed directory"}), 403
+
+        ext = os.path.splitext(file_path)[1].lower()
+
         # --- [FIX: UNCONDITIONAL RAW IMAGE COUNT] ---
         # We count the images immediately. This ensures the total is always correct,
         # even if image_mode="skip" or if selection_state is never loaded.
