@@ -900,16 +900,27 @@ def docling_convert_file():
         selection_token = data.get("selection_token")
         selected_image_ids = data.get("selected_image_ids", []) or []
 
-        # ===== STEP 4: Count images (if PDF) =====
+        # ===== STEP 4: Count images (PDF & DOCX) =====
         raw_total_images = 0
-        if ext == '.pdf':
-            try:
+        try:
+            if ext == '.pdf':
                 with fitz.open(file_path) as count_doc:
                     for page in count_doc:
                         raw_total_images += len(page.get_images(full=True))
-            except Exception as e:
-                logger.warning(f"Could not count images in {file_path}: {e}")
-                # Don't fail the whole conversion if image counting fails
+            
+            elif ext == '.docx':
+                # Fast check: Open as ZIP and count files in word/media/
+                try:
+                    with zipfile.ZipFile(file_path, 'r') as z:
+                        # DOCX images are stored in 'word/media/'
+                        media_files = [n for n in z.namelist() if n.startswith('word/media/')]
+                        raw_total_images = len(media_files)
+                except Exception as e:
+                    logger.warning(f"Could not count images in DOCX {file_path}: {e}")
+                    
+        except Exception as e:
+            logger.warning(f"Image counting failed for {file_path}: {e}")
+            # Don't fail the whole conversion; proceed with raw_total_images = 0
 
         # ===== STEP 5: Get/Create GUID =====
         guid = None
@@ -938,6 +949,23 @@ def docling_convert_file():
                 guid_source = "filename_fallback"
         except Exception as e:
             return create_error_response(file_path, f"Failed to generate GUID: {str(e)}", "GUID_ERROR")
+
+        # ==================================================================
+        #  STEP 5.5: PRE-FLIGHT CHECK (Skip if no images)
+        # ==================================================================
+        # If we found 0 images (PDF or DOCX), return early.
+        if raw_total_images == 0:
+            logger.info(f"Skipping conversion for {file_path}: File contains no images.")
+            return jsonify({
+                "success": True,
+                "skipped": True,
+                "conversion_status": "skipped_no_images",
+                "message": "File contains no images. Conversion bypassed.",
+                "file_path": file_path,
+                "filename": os.path.basename(file_path),
+                "file_id": guid,
+                "image_count_total": 0
+            })
 
         # ===== STEP 6: Decide converter =====
         try:
