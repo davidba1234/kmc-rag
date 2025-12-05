@@ -55,6 +55,11 @@ os.makedirs(JSON_CACHE_DIR, exist_ok=True)
 
 SUPPORTED_EXTENSIONS = ['.docx', '.pdf']
 
+# --- FileID Registry (Global Cache) ---
+# Maps fileID -> file_path for quick lookups
+FILE_ID_REGISTRY = {}
+FILE_PATH_CACHE = {}  # Maps file_path -> fileID for reverse lookups
+
 # --- ALL METADATA FIELDS ALWAYS INCLUDED ---
 ALL_METADATA_FIELDS = [
     "file_id",
@@ -78,19 +83,51 @@ ALL_METADATA_FIELDS = [
     "ai_description"
 ]
 
+def register_file_id(file_id: str, file_path: str) -> None:
+    """Register a fileID to file_path mapping."""
+    FILE_ID_REGISTRY[file_id] = file_path
+    FILE_PATH_CACHE[file_path] = file_id
+    logger.debug(f"Registered fileID: {file_id} -> {file_path}")
+
+def resolve_file_path(file_id: str) -> str | None:
+    """Resolve a fileID to its file_path. Returns None if not found."""
+    return FILE_ID_REGISTRY.get(file_id)
+
+def get_file_id_or_register(file_path: str) -> str:
+    """Get fileID for a path, or register it if not already present."""
+    if file_path in FILE_PATH_CACHE:
+        return FILE_PATH_CACHE[file_path]
+    
+    ext = os.path.splitext(file_path)[1].lower()
+    guid = None
+    
+    try:
+        if ext == '.pdf':
+            guid = read_pdf_guid(file_path)
+        elif ext == '.docx':
+            guid = extract_docx_guid(file_path)
+    except Exception as e:
+        logger.warning(f"Failed to extract GUID from {file_path}: {e}")
+    
+    if not guid:
+        guid = os.path.splitext(os.path.basename(file_path))[0].replace(' ', '_').replace('-', '_').lower()
+    
+    register_file_id(guid, file_path)
+    return guid
+
 def get_image_descriptions_from_api(image_info_list):
     # No-op stub: image analysis handled by /docling/convert-file two-step flow.
     return []
 
 # --- Error Handling Helper ---
 
-def create_error_response(file_path, error_message, error_type="CONVERSION_ERROR", details=None):
+def create_error_response(file_id_or_path, error_message, error_type="CONVERSION_ERROR", details=None):
     """
     Creates a standardized error response that returns 200 OK with error flag.
-    This allows n8n to gracefully handle errors and continue processing.
+    Accepts either fileID or file_path as first parameter.
     
     Args:
-        file_path: Path to the file that failed
+        file_id_or_path: FileID or file path that failed
         error_message: Human-readable error message
         error_type: Type of error (CONVERSION_ERROR, PARSING_ERROR, FILE_NOT_FOUND, etc.)
         details: Optional dict with additional error details
@@ -98,8 +135,17 @@ def create_error_response(file_path, error_message, error_type="CONVERSION_ERROR
     Returns:
         tuple: (jsonify response dict, 200 status code)
     """
-    # Attempt to include file timestamps (UTC) when available so callers
-    # (e.g., n8n) can make decisions based on file freshness even on errors.
+    # Determine if input is fileID or path
+    if file_id_or_path and file_id_or_path.startswith('/'):
+        file_path = file_id_or_path
+        file_id = FILE_PATH_CACHE.get(file_path)
+        if not file_id:
+            file_id = get_file_id_or_register(file_path) if os.path.exists(file_path) else None
+    else:
+        file_id = file_id_or_path
+        file_path = resolve_file_path(file_id)
+    
+    # Attempt to include file timestamps (UTC) when available
     last_modified = None
     created_date = None
     try:
@@ -108,13 +154,14 @@ def create_error_response(file_path, error_message, error_type="CONVERSION_ERROR
             last_modified = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
             created_date = datetime.fromtimestamp(st.st_ctime, tz=timezone.utc).isoformat()
     except Exception as e:
-        logger.warning(f"Failed to stat file for error response timestamps: {file_path}: {e}")
+        logger.warning(f"Failed to stat file for error response timestamps: {e}")
 
     response = {
         "success": False,
         "error": True,
         "error_type": error_type,
         "error_message": error_message,
+        "file_id": file_id,
         "file_path": file_path,
         "filename": os.path.basename(file_path) if file_path else "unknown",
         "conversion_status": "failed",
@@ -125,7 +172,7 @@ def create_error_response(file_path, error_message, error_type="CONVERSION_ERROR
     if details:
         response["error_details"] = details
     
-    logger.error(f"[{error_type}] {file_path}: {error_message}")
+    logger.error(f"[{error_type}] {file_id}: {error_message}")
     return jsonify(response), 200
 
 # --- Helper Functions ---
@@ -864,7 +911,7 @@ def list_files():
                         guid = extract_docx_guid(path)
                         guid_source = 'docx_settings' if guid else 'filename_fallback'
                     except Exception as e:
-                        logger.warning(f"Failed to read DOCX GUID for {path}: {e}")
+                        logger.warning(f"Failed to read DOCX GUID foKr {path}: {e}")
                     try:
                         date_reviewed, date_next = extract_custom_metadata(path)
                     except Exception:
@@ -917,44 +964,67 @@ def list_files():
 @app.route('/docling/convert-file', methods=['POST'])
 def docling_convert_file():
     """
-    Convert a single file (DOCX or PDF) with comprehensive error handling.
+    Convert a single file (DOCX or PDF) using its fileID as the unique identifier.
     Returns 200 OK with error flag on failure, allowing n8n to skip and continue.
     """
+    file_id = None
     file_path = None
     try:
         # ===== STEP 1: Parse request =====
         try:
             data = request.get_json(force=True)
-            if not data or 'file_path' not in data:
-                return jsonify({"error": "Missing 'file_path' in JSON request body"}), 400
-            file_path = data['file_path']
+            if not data or 'file_id' not in data:
+                return jsonify({"error": "Missing 'file_id' in JSON request body"}), 400
+            file_id = data['file_id']
         except Exception as e:
             return jsonify({"error": f"Invalid request: {str(e)}"}), 400
         
-        # ===== STEP 2: Validate file path =====
+        # ===== STEP 2: Resolve fileID to file_path (with auto-register fallback) =====
+        try:
+            file_path = resolve_file_path(file_id)
+            
+            # If not in registry, try to find file by ID and auto-register
+            if not file_path:
+                # Look for a file that matches this ID (could be from external source)
+                # This supports calling convert-file with an ID even if list-files wasn't called first
+                all_files = find_all_supported_files()
+                for file_info in all_files:
+                    candidate_path = file_info['full_path']
+                    # Get the ID that would be assigned to this file
+                    candidate_id = get_file_id_or_register(candidate_path)
+                    if candidate_id == file_id:
+                        file_path = candidate_path
+                        break
+                
+                if not file_path:
+                    return create_error_response(file_id, f"FileID not found and could not locate matching file: {file_id}", "FILE_ID_NOT_FOUND")
+        except Exception as e:
+            return create_error_response(file_id, f"Failed to resolve fileID: {str(e)}", "FILE_ID_RESOLUTION_ERROR")
+        
+        # ===== STEP 3: Validate file path =====
         try:
             if not os.path.exists(file_path):
-                return create_error_response(file_path, f"File not found: {file_path}", "FILE_NOT_FOUND")
+                return create_error_response(file_id, f"File not found: {file_path}", "FILE_NOT_FOUND")
             if not os.path.abspath(file_path).startswith(os.path.abspath(BASE_DIR)):
-                return create_error_response(file_path, "File path is outside allowed directory", "SECURITY_ERROR")
+                return create_error_response(file_id, "File path is outside allowed directory", "SECURITY_ERROR")
         except Exception as e:
-            return create_error_response(file_path, f"Failed to validate file path: {str(e)}", "PATH_VALIDATION_ERROR")
+            return create_error_response(file_id, f"Failed to validate file path: {str(e)}", "PATH_VALIDATION_ERROR")
         
-        # ===== STEP 3: Extract extension =====
+        # ===== STEP 4: Extract extension =====
         try:
             ext = os.path.splitext(file_path)[1].lower()
             if ext not in SUPPORTED_EXTENSIONS:
-                return create_error_response(file_path, f"Unsupported file type: {ext}", "UNSUPPORTED_FORMAT")
+                return create_error_response(file_id, f"Unsupported file type: {ext}", "UNSUPPORTED_FORMAT")
         except Exception as e:
-            return create_error_response(file_path, f"Failed to determine file type: {str(e)}", "FILE_TYPE_ERROR")
+            return create_error_response(file_id, f"Failed to determine file type: {str(e)}", "FILE_TYPE_ERROR")
 
-        # ===== STEP 3b: File timestamps (UTC) =====
+        # ===== STEP 5: File timestamps (UTC) =====
         try:
             stat = os.stat(file_path)
             last_modified_iso = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
             created_date_iso = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat()
         except Exception as e:
-            logger.warning(f"Failed to stat file for timestamps {file_path}: {e}")
+            logger.warning(f"Failed to stat file for timestamps: {e}")
             last_modified_iso = None
             created_date_iso = None
 
@@ -966,7 +1036,7 @@ def docling_convert_file():
         selection_token = data.get("selection_token")
         selected_image_ids = data.get("selected_image_ids", []) or []
 
-      # ===== STEP 4: Count images (PDF & DOCX) =====
+        # ===== STEP 6: Count images (PDF & DOCX) =====
         # Fast pre-check to see what we are dealing with
         raw_total_images = 0
         try:
@@ -986,40 +1056,12 @@ def docling_convert_file():
         except Exception as e:
             logger.warning(f"Image counting failed for {file_path}: {e}")
 
-        # ===== STEP 5: Get/Create GUID =====
-        guid = None
-        guid_source = "unknown"
-        try:
-            if ext == '.pdf':
-                try:
-                    guid = get_or_create_pdf_guid(file_path)
-                    guid_source = "pdf_metadata"
-                except Exception as e:
-                    logger.warning(f"Failed to get PDF GUID for {file_path}: {e}")
-                    guid = None
-            elif ext == '.docx':
-                try:
-                    guid = extract_docx_guid(file_path)
-                    if guid:
-                        guid_source = "docx_settings"
-                except Exception as e:
-                    logger.warning(f"Failed to extract DOCX GUID for {file_path}: {e}")
-                    guid = None
-            
-            if not guid:
-                filename_without_ext = os.path.splitext(os.path.basename(file_path))[0]
-                guid = filename_without_ext.replace(' ', '_').replace('-', '_').lower()
-                guid_source = "filename_fallback"
-        except Exception as e:
-            return create_error_response(file_path, f"Failed to generate GUID: {str(e)}", "GUID_ERROR")
-
-        # ==================================================================
-        # STEP 6: SURVEY MODE (image_mode="ask")
-        # ==================================================================
+        # ===== STEP 7: SURVEY MODE (image_mode="ask") =====
         # If the workflow asks us to survey, we return metadata immediately.
         # We do NOT run Docling here. We wait for user confirmation.
         if image_mode == "ask":
-            logger.info(f"Surveying file (Ask Mode): {file_path} - Images found: {raw_total_images}")
+            logger.info(f"Surveying file (Ask Mode): {file_id} - Images found: {raw_total_images}")
+            
             
             # 1. Prepare Image Manifest (if images exist)
             image_manifest = []
@@ -1027,15 +1069,15 @@ def docling_convert_file():
             
             if ext == ".pdf" and raw_total_images > 0:
                 try:
-                    image_manifest = build_pdf_image_manifest(file_path, guid)
+                    image_manifest = build_pdf_image_manifest(file_path, file_id)
                     if image_manifest:
-                        token_seed = f"{guid}:{file_path}:{time.time()}:{len(image_manifest)}"
+                        token_seed = f"{file_id}:{file_path}:{time.time()}:{len(image_manifest)}"
                         selection_token = hashlib.sha256(token_seed.encode("utf-8")).hexdigest()[:32]
                         
                         # Save state so we can retrieve these specific images later
                         save_selection_state(selection_token, {
                             "file_path": file_path,
-                            "guid": guid,
+                            "file_id": file_id,
                             "manifest": image_manifest,
                             "created_at": datetime.now(timezone.utc).isoformat()
                         })
@@ -1046,13 +1088,13 @@ def docling_convert_file():
             # This stops the script here. The UI will pick this up.
             return jsonify({
                 "success": True,
-                "status": "pending_approval", # Status for your UI logic
-                "skipped": True,              # Flag for n8n flow control
+                "status": "pending_approval",
+                "skipped": True,
                 "file_path": file_path,
                 "filename": os.path.basename(file_path),
                 "lastModified": last_modified_iso,
                 "createdDate": created_date_iso,
-                "file_id": guid,
+                "file_id": file_id,
                 "image_count_total": raw_total_images,
                 
                 # Image Selection Data
@@ -1078,21 +1120,21 @@ def docling_convert_file():
                 try:
                     content = docx_to_json(file_path)
                 except Exception as e:
-                    return create_error_response(file_path, f"Failed to convert DOCX: {str(e)}", "DOCX_CONVERSION_ERROR", {"step": "docx_to_json"})
+                    return create_error_response(file_id, f"Failed to convert DOCX: {str(e)}", "DOCX_CONVERSION_ERROR", {"step": "docx_to_json"})
                 
                 if "error" in content:
-                    return create_error_response(file_path, content.get("error", "Unknown error in DOCX conversion"), "DOCX_PARSING_ERROR", {"step": "docx_parsing"})
+                    return create_error_response(file_id, content.get("error", "Unknown error in DOCX conversion"), "DOCX_PARSING_ERROR", {"step": "docx_parsing"})
                 
                 try:
                     date_reviewed, date_next = extract_custom_metadata(file_path)
                 except Exception as e:
-                    logger.warning(f"Failed to extract custom metadata from DOCX {file_path}: {e}")
+                    logger.warning(f"Failed to extract custom metadata from DOCX: {e}")
                     date_reviewed, date_next = None, None
                 
                 try:
                     full_text = "\n\n".join(content.get("paragraphs", []))
                 except Exception as e:
-                    return create_error_response(file_path, f"Failed to extract text from DOCX: {str(e)}", "TEXT_EXTRACTION_ERROR")
+                    return create_error_response(file_id, f"Failed to extract text from DOCX: {str(e)}", "TEXT_EXTRACTION_ERROR")
                 
                 try:
                     ai_title, ai_description = generate_ai_title_description(full_text, os.path.basename(file_path))
@@ -1101,13 +1143,13 @@ def docling_convert_file():
                     ai_title, ai_description = None, None
                 
                 extra_data = {
-                    "file_id": guid,
+                    "file_id": file_id,
                     "paragraph_count": len(content.get("paragraphs", [])),
                     "table_count": len(content.get("tables", [])),
                     "word_count": len(full_text.split()),
                     "character_count": len(full_text),
-                    "has_guid": bool(guid),
-                    "guid_source": guid_source,
+                    "has_guid": True,
+                    "guid_source": "file_id",
                     "DateReviewed": date_reviewed,
                     "DateNext": date_next,
                     "ai_title": ai_title,
@@ -1122,7 +1164,7 @@ def docling_convert_file():
                     try:
                         chunks = perform_chunking(full_text, complete_metadata, chunking_options)
                     except Exception as e:
-                        logger.warning(f"Failed to chunk DOCX {file_path}: {e}")
+                        logger.warning(f"Failed to chunk DOCX: {e}")
                         chunks = []
 
                 return jsonify({
@@ -1142,7 +1184,7 @@ def docling_convert_file():
                     "createdDate": created_date_iso
                 })
             except Exception as e:
-                return create_error_response(file_path, f"DOCX conversion failed: {str(e)}", "DOCX_CONVERSION_FAILED", {"exception_type": type(e).__name__})
+                return create_error_response(file_id, f"DOCX conversion failed: {str(e)}", "DOCX_CONVERSION_FAILED", {"exception_type": type(e).__name__})
 
         # [Path B: Heavy Docling Conversion]
         try:
@@ -1150,14 +1192,14 @@ def docling_convert_file():
             try:
                 conversion_result = docling_converter.convert(file_path)
             except Exception as e:
-                return create_error_response(file_path, f"Docling conversion failed: {str(e)}", "DOCLING_CONVERSION_ERROR", {"exception_type": type(e).__name__})
+                return create_error_response(file_id, f"Docling conversion failed: {str(e)}", "DOCLING_CONVERSION_ERROR", {"exception_type": type(e).__name__})
             
             try:
                 document = conversion_result.document
                 document_dict = document.export_to_dict()
                 full_text_md = document.export_to_markdown()
             except Exception as e:
-                return create_error_response(file_path, f"Failed to export document: {str(e)}", "DOCUMENT_EXPORT_ERROR", {"exception_type": type(e).__name__})
+                return create_error_response(file_id, f"Failed to export document: {str(e)}", "DOCUMENT_EXPORT_ERROR", {"exception_type": type(e).__name__})
 
             extra_meta = {}
             if ext == ".docx":
@@ -1174,11 +1216,11 @@ def docling_convert_file():
             if ext == ".pdf" and image_mode == "selected":
                 try:
                     if not selection_token:
-                        return create_error_response(file_path, "selection_token is required when image_mode='selected'", "MISSING_TOKEN")
+                        return create_error_response(file_id, "selection_token is required when image_mode='selected'", "MISSING_TOKEN")
                     
                     selection_state = load_selection_state(selection_token)
                     if not selection_state or selection_state.get("file_path") != file_path:
-                        return create_error_response(file_path, "Invalid or expired selection_token", "INVALID_TOKEN")
+                        return create_error_response(file_id, "Invalid or expired selection_token", "INVALID_TOKEN")
 
                     try:
                         allowed_keys = {"pdf_path", "selection_state", "selected_ids", "model", "per_image_max_tokens", "sleep_sec"}
@@ -1217,13 +1259,13 @@ def docling_convert_file():
             image_count_analyzed = len(image_descs) if image_descs else 0
 
             extra_data = {
-                "file_id": guid,
+                "file_id": file_id,
                 "paragraph_count": full_text_md.count('\n\n') + 1 if full_text_md else 0,
                 "table_count": len(document_dict.get("tables", [])) if document_dict else 0,
                 "word_count": len(full_text_md.split()) if full_text_md else 0,
                 "character_count": len(full_text_md) if full_text_md else 0,
-                "has_guid": bool(guid),
-                "guid_source": guid_source,
+                "has_guid": True,
+                "guid_source": "file_id",
                 "ai_title": ai_title,
                 "ai_description": ai_description,
                 "image_count_total": raw_total_images,
@@ -1251,6 +1293,7 @@ def docling_convert_file():
             resp = {
                 "success": True,
                 "used_converter": "docling",
+                "file_id": file_id,
                 "file_path": file_path,
                 "filename": os.path.basename(file_path),
                 "conversion_status": str(conversion_result.status) if conversion_result else "unknown",
@@ -1270,14 +1313,35 @@ def docling_convert_file():
             return jsonify(resp)
 
         except Exception as e:
-            return create_error_response(file_path, f"Docling conversion failed: {str(e)}", "DOCLING_CONVERSION_FAILED", {"exception_type": type(e).__name__})
+            return create_error_response(file_id, f"Docling conversion failed: {str(e)}", "DOCLING_CONVERSION_FAILED", {"exception_type": type(e).__name__})
 
     except Exception as e:
         # Catch-all for any unexpected errors
         logger.error(f"Unexpected error in docling_convert_file: {e}", exc_info=True)
-        return create_error_response(file_path or "unknown", f"Unexpected server error: {str(e)}", "UNEXPECTED_ERROR", {"exception_type": type(e).__name__})
-        logger.error(f"Error processing file with Docling/native: {e}", exc_info=True)
-        return jsonify({"error": f"Error processing file: {str(e)}"}), 500
+        return create_error_response(file_id or "unknown", f"Unexpected server error: {str(e)}", "UNEXPECTED_ERROR", {"exception_type": type(e).__name__})
+
+@app.route('/file-id/resolve', methods=['GET'])
+def resolve_file_endpoint():
+    """Resolve a fileID to its file path."""
+    try:
+        file_id = request.args.get('file_id')
+        if not file_id:
+            return jsonify({"error": "Missing 'file_id' parameter", "success": False}), 400
+        
+        file_path = resolve_file_path(file_id)
+        
+        if not file_path:
+            return jsonify({"error": f"FileID not found: {file_id}", "success": False}), 404
+        
+        return jsonify({
+            "success": True,
+            "file_id": file_id,
+            "file_path": file_path,
+            "filename": os.path.basename(file_path)
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in /file-id/resolve: {e}", exc_info=True)
+        return jsonify({"error": str(e), "success": False}), 500
 
 @app.route('/clear-cache', methods=['POST'])
 def clear_cache():
