@@ -68,8 +68,8 @@ ALL_METADATA_FIELDS = [
     "character_count",
     "paragraph_count",
     "table_count",
-    "last_modified_iso",
-    "created_date_iso",
+    "lastModified",
+    "createdDate",
     "has_guid",
     "guid_source",
     "DateReviewed",
@@ -98,6 +98,18 @@ def create_error_response(file_path, error_message, error_type="CONVERSION_ERROR
     Returns:
         tuple: (jsonify response dict, 200 status code)
     """
+    # Attempt to include file timestamps (UTC) when available so callers
+    # (e.g., n8n) can make decisions based on file freshness even on errors.
+    last_modified = None
+    created_date = None
+    try:
+        if file_path and os.path.exists(file_path):
+            st = os.stat(file_path)
+            last_modified = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+            created_date = datetime.fromtimestamp(st.st_ctime, tz=timezone.utc).isoformat()
+    except Exception as e:
+        logger.warning(f"Failed to stat file for error response timestamps: {file_path}: {e}")
+
     response = {
         "success": False,
         "error": True,
@@ -106,7 +118,9 @@ def create_error_response(file_path, error_message, error_type="CONVERSION_ERROR
         "file_path": file_path,
         "filename": os.path.basename(file_path) if file_path else "unknown",
         "conversion_status": "failed",
-        "timestamp": datetime.utcnow().isoformat() + "Z"
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "lastModified": last_modified,
+        "createdDate": created_date
     }
     if details:
         response["error_details"] = details
@@ -131,8 +145,8 @@ def make_complete_metadata(file_path, extra_data=None):
         "file_extension": ext,
         "file_size": file_stats.st_size,
         "file_size_mb": round(file_stats.st_size / (1024 * 1024), 2),
-        "last_modified_iso": datetime.fromtimestamp(file_stats.st_mtime).isoformat(),
-        "created_date_iso": datetime.fromtimestamp(file_stats.st_ctime).isoformat(),
+        "lastModified": datetime.fromtimestamp(file_stats.st_mtime, tz=timezone.utc).isoformat(),
+        "createdDate": datetime.fromtimestamp(file_stats.st_ctime, tz=timezone.utc).isoformat(),
     }
 
     # Initialize all fields from ALL_METADATA_FIELDS with None
@@ -555,7 +569,7 @@ def find_all_supported_files():
                         "filename": filename,
                         "full_path": file_path,
                         "subfolder": parent_dir,
-                        "last_modified_iso": datetime.fromtimestamp(file_stats.st_mtime).isoformat()
+                        "lastModified": datetime.fromtimestamp(file_stats.st_mtime, tz=timezone.utc).isoformat()
                     })
                 except OSError as e:
                     logger.warning(f"Could not stat file {file_path}: {e}")
@@ -828,31 +842,73 @@ def ensure_guids():
 @app.route('/list-files', methods=['GET'])
 def list_files():
     try:
-        file_info_list = find_all_supported_files() 
-        
-        for file_info in file_info_list:
+        raw_file_list = find_all_supported_files()
+        enriched_files = []
+
+        for file_info in raw_file_list:
+            path = file_info.get('full_path')
+            if not path:
+                logger.warning("Skipping file with no full_path in file_info")
+                continue
+
             try:
-                path = file_info['full_path']
-                mod_time_unix = os.path.getmtime(path)
-                mod_time_iso = datetime.fromtimestamp(mod_time_unix, tz=timezone.utc).isoformat()
-                
-                file_id = None
-                if path.lower().endswith('.docx'):
-                    file_id = extract_docx_guid(path)
-                elif path.lower().endswith('.pdf'):
-                    file_id = read_pdf_guid(path)
+                # Determine GUID/file_id and basic provenance without mutating files
+                ext = os.path.splitext(path)[1].lower()
+                guid = None
+                guid_source = None
+                date_reviewed = None
+                date_next = None
 
-                if not file_id:
+                if ext == '.docx':
+                    try:
+                        guid = extract_docx_guid(path)
+                        guid_source = 'docx_settings' if guid else 'filename_fallback'
+                    except Exception as e:
+                        logger.warning(f"Failed to read DOCX GUID for {path}: {e}")
+                    try:
+                        date_reviewed, date_next = extract_custom_metadata(path)
+                    except Exception:
+                        date_reviewed, date_next = None, None
+
+                elif ext == '.pdf':
+                    try:
+                        guid = read_pdf_guid(path)
+                        guid_source = 'pdf_metadata' if guid else 'filename_fallback'
+                    except Exception as e:
+                        logger.warning(f"Failed to read PDF GUID for {path}: {e}")
+
+                # Fallback id when no GUID present
+                if not guid:
                     filename_without_ext = os.path.splitext(os.path.basename(path))[0]
-                    file_id = f"fallback_{filename_without_ext.replace(' ', '_').lower()}"
+                    guid = f"fallback_{filename_without_ext.replace(' ', '_').lower()}"
+                    if not guid_source:
+                        guid_source = 'filename_fallback'
 
-                file_info['lastModified'] = mod_time_iso
-                file_info['file_id'] = file_id
+                extra = {
+                    'file_id': guid,
+                    'has_guid': bool(guid) and not str(guid).startswith('fallback_'),
+                    'guid_source': guid_source,
+                    'DateReviewed': date_reviewed,
+                    'DateNext': date_next
+                }
+
+                # Build the full metadata dict using existing helper
+                complete_meta = make_complete_metadata(path, extra)
+
+                enriched_files.append(complete_meta)
 
             except Exception as inner_e:
-                logger.error(f"Error processing file {file_info.get('full_path', 'N/A')}: {inner_e}")
+                logger.error(f"Error processing file {path}: {inner_e}", exc_info=True)
+                # Fallback minimal entry so list remains stable
+                enriched_files.append({
+                    'filename': os.path.basename(path) if path else None,
+                    'full_path': path,
+                    'file_id': None,
+                    'lastModified': None,
+                    'createdDate': None
+                })
 
-        return jsonify({"files": file_info_list, "count": len(file_info_list)})
+        return jsonify({"files": enriched_files, "count": len(enriched_files)})
 
     except Exception as e:
         logger.error(f"Error in /list-files: {e}", exc_info=True)
@@ -892,6 +948,16 @@ def docling_convert_file():
         except Exception as e:
             return create_error_response(file_path, f"Failed to determine file type: {str(e)}", "FILE_TYPE_ERROR")
 
+        # ===== STEP 3b: File timestamps (UTC) =====
+        try:
+            stat = os.stat(file_path)
+            last_modified_iso = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+            created_date_iso = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat()
+        except Exception as e:
+            logger.warning(f"Failed to stat file for timestamps {file_path}: {e}")
+            last_modified_iso = None
+            created_date_iso = None
+
         # [Existing Params]
         force_refresh = data.get("force_refresh", False)
         do_chunking = data.get("do_chunking", False)
@@ -900,7 +966,8 @@ def docling_convert_file():
         selection_token = data.get("selection_token")
         selected_image_ids = data.get("selected_image_ids", []) or []
 
-        # ===== STEP 4: Count images (PDF & DOCX) =====
+      # ===== STEP 4: Count images (PDF & DOCX) =====
+        # Fast pre-check to see what we are dealing with
         raw_total_images = 0
         try:
             if ext == '.pdf':
@@ -909,10 +976,8 @@ def docling_convert_file():
                         raw_total_images += len(page.get_images(full=True))
             
             elif ext == '.docx':
-                # Fast check: Open as ZIP and count files in word/media/
                 try:
                     with zipfile.ZipFile(file_path, 'r') as z:
-                        # DOCX images are stored in 'word/media/'
                         media_files = [n for n in z.namelist() if n.startswith('word/media/')]
                         raw_total_images = len(media_files)
                 except Exception as e:
@@ -920,7 +985,6 @@ def docling_convert_file():
                     
         except Exception as e:
             logger.warning(f"Image counting failed for {file_path}: {e}")
-            # Don't fail the whole conversion; proceed with raw_total_images = 0
 
         # ===== STEP 5: Get/Create GUID =====
         guid = None
@@ -942,7 +1006,6 @@ def docling_convert_file():
                     logger.warning(f"Failed to extract DOCX GUID for {file_path}: {e}")
                     guid = None
             
-            # Fallback: use filename
             if not guid:
                 filename_without_ext = os.path.splitext(os.path.basename(file_path))[0]
                 guid = filename_without_ext.replace(' ', '_').replace('-', '_').lower()
@@ -951,83 +1014,63 @@ def docling_convert_file():
             return create_error_response(file_path, f"Failed to generate GUID: {str(e)}", "GUID_ERROR")
 
         # ==================================================================
-        #  STEP 5.5: PRE-FLIGHT CHECK (Skip if no images)
+        # STEP 6: SURVEY MODE (image_mode="ask")
         # ==================================================================
-        # If we found 0 images (PDF or DOCX), return early.
-        if raw_total_images == 0:
-            logger.info(f"Skipping conversion for {file_path}: File contains no images.")
-            return jsonify({
-                "success": True,
-                "skipped": True,
-                "conversion_status": "skipped_no_images",
-                "message": "File contains no images. Conversion bypassed.",
-                "file_path": file_path,
-                "filename": os.path.basename(file_path),
-                "file_id": guid,
-                "image_count_total": 0
-            })
-
-        # ===== STEP 6: Decide converter =====
-        try:
-            use_docling = False
-            if ext == '.pdf':
-                use_docling = True
-            elif ext == '.docx':
-                use_docling = is_docx_complex(file_path)
+        # If the workflow asks us to survey, we return metadata immediately.
+        # We do NOT run Docling here. We wait for user confirmation.
+        if image_mode == "ask":
+            logger.info(f"Surveying file (Ask Mode): {file_path} - Images found: {raw_total_images}")
             
-            logger.info(f"convert-file: {file_path} selected converter = {'docling' if use_docling else 'native'}")
-        except Exception as e:
-            return create_error_response(file_path, f"Failed to determine converter: {str(e)}", "CONVERTER_SELECTION_ERROR")
-
-        # ==================================================================
-        # [FAST PATH] IMAGE SCANNING (Moved BEFORE Docling Conversion)
-        # ==================================================================
-        try:
-            if use_docling and ext == ".pdf" and image_mode == "ask":
-                logger.info(f"Fast scanning PDF for images: {file_path}")
+            # 1. Prepare Image Manifest (if images exist)
+            image_manifest = []
+            selection_token = None
+            
+            if ext == ".pdf" and raw_total_images > 0:
                 try:
                     image_manifest = build_pdf_image_manifest(file_path, guid)
-                except Exception as e:
-                    logger.warning(f"Image scan failed for {file_path}: {e}")
-                    image_manifest = []
-                
-                if len(image_manifest) > 0:
-                    try:
+                    if image_manifest:
                         token_seed = f"{guid}:{file_path}:{time.time()}:{len(image_manifest)}"
-                        token = hashlib.sha256(token_seed.encode("utf-8")).hexdigest()[:32]
-                        selection_state = {
+                        selection_token = hashlib.sha256(token_seed.encode("utf-8")).hexdigest()[:32]
+                        
+                        # Save state so we can retrieve these specific images later
+                        save_selection_state(selection_token, {
                             "file_path": file_path,
                             "guid": guid,
                             "manifest": image_manifest,
-                            "created_at": datetime.utcnow().isoformat() + "Z"
-                        }
-                        save_selection_state(token, selection_state)
-                        
-                        # RETURN IMMEDIATELY - Do not run Docling OCR yet
-                        return jsonify({
-                            "success": True,
-                            "used_converter": "docling_fast_scan",
-                            "needs_image_selection": True,
-                            "message": "Images found. Select images and resubmit with image_mode='selected'.",
-                            "file_path": file_path,
-                            "filename": os.path.basename(file_path),
-                            "conversion_status": "pending_selection",
-                            "image_manifest": image_manifest,
-                            "selection_token": token,
-                            "total_images_detected": raw_total_images 
+                            "created_at": datetime.now(timezone.utc).isoformat()
                         })
-                    except Exception as e:
-                        logger.warning(f"Failed to save selection state: {e}")
-                        # Fall through to standard conversion
-                else:
-                    logger.info("No images found during fast scan. Proceeding to auto-conversion.")
-        except Exception as e:
-            logger.warning(f"Image scanning phase failed (non-fatal): {e}")
-            # Continue with standard conversion
+                except Exception as e:
+                    logger.warning(f"Failed to build image manifest: {e}")
 
+            # 2. Return 'Pending Approval' JSON
+            # This stops the script here. The UI will pick this up.
+            return jsonify({
+                "success": True,
+                "status": "pending_approval", # Status for your UI logic
+                "skipped": True,              # Flag for n8n flow control
+                "file_path": file_path,
+                "filename": os.path.basename(file_path),
+                "lastModified": last_modified_iso,
+                "createdDate": created_date_iso,
+                "file_id": guid,
+                "image_count_total": raw_total_images,
+                
+                # Image Selection Data
+                "needs_image_selection": (len(image_manifest) > 0),
+                "image_manifest": image_manifest,
+                "selection_token": selection_token
+            })
+
+        # The code below only runs if image_mode is "selected" or "force"
+        # (i.e. AFTER the user has clicked 'Proceed' in the UI).
         # ==================================================================
-        # [SLOW PATH] STANDARD CONVERSION (Native DOCX or Docling)
+        # [SLOW PATH] STANDARD CONVERSION
         # ==================================================================
+        
+        # FIX: Define use_docling here. 
+        # Since you want Docling for all files, we set this to True.
+        # This ensures the script skips "[Path A: Native DOCX]" below and goes straight to Docling.
+        use_docling = True
 
         # [Path A: Native DOCX]
         if ext == '.docx' and not use_docling:
@@ -1094,7 +1137,9 @@ def docling_convert_file():
                         "metadata": content.get("metadata")
                     },
                     "metadata": complete_metadata,
-                    "chunks": chunks
+                    "chunks": chunks,
+                    "lastModified": last_modified_iso,
+                    "createdDate": created_date_iso
                 })
             except Exception as e:
                 return create_error_response(file_path, f"DOCX conversion failed: {str(e)}", "DOCX_CONVERSION_FAILED", {"exception_type": type(e).__name__})
@@ -1214,6 +1259,9 @@ def docling_convert_file():
                 "metadata": complete_metadata,
                 "chunks": chunks
             }
+            # Include timestamps at top-level for easy access
+            resp["lastModified"] = last_modified_iso
+            resp["createdDate"] = created_date_iso
             if selection_state:
                 resp["image_manifest"] = selection_state.get("manifest", [])
             if image_descs:
