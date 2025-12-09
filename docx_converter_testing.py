@@ -291,99 +291,6 @@ def extract_custom_metadata(doc_path: str):
         logger.warning(f"Failed to extract custom metadata from {doc_path}: {e}")
     return date_reviewed, date_next
 
-def is_docx_complex(docx_path,
-                    min_tables_for_complex=1,
-                    min_images_for_complex=1,
-                    max_paragraphs_for_simple=300,
-                    avg_run_threshold=2.5):
-    """Returns True if the DOCX should be processed by Docling (complex)."""
-    try:
-        with zipfile.ZipFile(docx_path, 'r') as z:
-            namelist = z.namelist()
-            media_files = [n for n in namelist if n.startswith('word/media/')]
-            embedded_objects = [n for n in namelist if n.startswith('word/embeddings') or n.endswith('.bin')]
-            has_images = len(media_files) >= min_images_for_complex
-            has_embedded = len(embedded_objects) > 0
-
-        doc = Document(docx_path)
-        num_tables = len(doc.tables)
-        num_paragraphs = len(doc.paragraphs)
-
-        total_runs = 0
-        paragraphs_sampled = 0
-        for p in doc.paragraphs:
-            if not p.text.strip():
-                continue
-            paragraphs_sampled += 1
-            try:
-                total_runs += len(p.runs)
-            except Exception:
-                total_runs += 1
-            if paragraphs_sampled >= 200:
-                break
-        avg_runs = (total_runs / paragraphs_sampled) if paragraphs_sampled else 1
-
-        if num_tables >= min_tables_for_complex:
-            return True
-        if has_images or has_embedded:
-            return True
-        if num_paragraphs > max_paragraphs_for_simple:
-            return True
-        if avg_runs > avg_run_threshold:
-            return True
-
-        return False
-    except Exception as e:
-        logger.warning(f"is_docx_complex failed for {docx_path}: {e}", exc_info=True)
-        return True
-
-def extract_tables_with_pdfplumber(pdf_path):
-    """Extract tables from PDF using pdfplumber"""
-    tables = []
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                page_tables = page.extract_tables()
-                for table in page_tables or []:
-                    if table and len(table) > 0:
-                        clean_table = []
-                        for row in table:
-                            clean_row = [cell.strip() if cell else "" for cell in row]
-                            if any(clean_row):
-                                clean_table.append(clean_row)
-                        
-                        if clean_table:
-                            tables.append({
-                                "page": page_num + 1,
-                                "headers": clean_table[0] if clean_table else [],
-                                "rows": clean_table[1:] if len(clean_table) > 1 else [],
-                                "raw_data": clean_table
-                            })
-    except Exception as e:
-        logger.warning(f"pdfplumber table extraction failed for {pdf_path}: {e}")
-    return tables
-
-def format_table_for_rag(table_data):
-    """Format table data for better RAG retrieval"""
-    if not table_data or not table_data.get("raw_data"):
-        return ""
-    
-    raw_data = table_data["raw_data"]
-    formatted_lines = []
-    
-    formatted_lines.append("\n--- TABLE START ---")
-    
-    for row_index, row in enumerate(raw_data):
-        if row and any(cell.strip() for cell in row if cell):
-            row_text = " | ".join([cell for cell in row if cell and cell.strip()])
-            formatted_lines.append(row_text)
-            
-            if row_index == 0:
-                formatted_lines.append("-" * 40)
-    
-    formatted_lines.append("--- TABLE END ---\n")
-    return "\n".join(formatted_lines)
-
 def generate_ai_title_description(full_text: str, fallback_filename: str) -> tuple[str, str]:
     def sample(text: str, max_chars: int = 12000) -> str:
         if len(text) <= max_chars:
@@ -460,141 +367,6 @@ def generate_ai_title_description(full_text: str, fallback_filename: str) -> tup
 
 # --- Core Conversion Functions ---
 
-def docx_to_json(docx_path):
-    logger.info(f"Starting DOCX conversion for file: {docx_path}")
-    try:
-        doc = Document(docx_path)
-        filename_without_ext, _ = os.path.splitext(os.path.basename(docx_path))
-        filename_based_id = filename_without_ext.replace(' ', '_').replace('-', '_').lower()
-        
-        guid = extract_docx_guid(docx_path)
-        file_id = guid or filename_based_id
-        has_guid = guid is not None
-
-        date_reviewed, date_next = extract_custom_metadata(docx_path)
-        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-        
-        # Create complete metadata with all fields
-        extra_data = {
-            "file_id": file_id,
-            "paragraph_count": len(paragraphs),
-            "table_count": len(doc.tables),
-            "word_count": sum(len(p.split()) for p in paragraphs),
-            "character_count": sum(len(p) for p in paragraphs),
-            "has_guid": has_guid,
-            "guid_source": "docx_settings" if has_guid else "filename_fallback",
-            "DateReviewed": date_reviewed,
-            "DateNext": date_next
-        }
-        
-        metadata = make_complete_metadata(docx_path, extra_data)
-
-        content = {
-            "file_id": file_id,
-            "filename": os.path.basename(docx_path),
-            "full_path": docx_path,
-            "subfolder": os.path.basename(os.path.dirname(docx_path)),
-            "paragraphs": paragraphs,
-            "tables": [[cell.text.strip() for cell in row.cells] for table in doc.tables for row in table.rows],
-            "metadata": metadata
-        }
-        return content
-    except Exception as e:
-        logger.error(f"Failed to convert {docx_path}: {e}", exc_info=True)
-        return {"error": f"Failed to convert {docx_path}: {str(e)}"}
-
-def pdf_to_json(pdf_path):
-    logger.info(f"Starting PDF conversion for file: {pdf_path}")
-    try:
-        file_id = get_or_create_pdf_guid(pdf_path)
-        
-        # Image extraction
-        doc = fitz.open(pdf_path)
-        image_info = []
-        image_output_folder = os.path.join(IMAGE_OUTPUT_DIR, file_id)
-        os.makedirs(image_output_folder, exist_ok=True)
-
-        for page_index in range(len(doc)):
-            page = doc[page_index]
-            image_list = page.get_images(full=True)
-            for img_index, img in enumerate(image_list):
-                xref = img[0]
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                image_ext = base_image["ext"]
-                
-                image_filename = f"page{page_index+1}_img{img_index+1}.{image_ext}"
-                image_save_path = os.path.join(image_output_folder, image_filename)
-                
-                with open(image_save_path, "wb") as img_file:
-                    img_file.write(image_bytes)
-                
-                image_info.append({
-                    "path": image_save_path,
-                    "page": page_index + 1,
-                    "xref": xref
-                })
-
-        # Extract tables using pdfplumber
-        extracted_tables = extract_tables_with_pdfplumber(pdf_path)
-        
-        # Extract text using PyMuPDF
-        full_text = "".join(page.get_textpage().extractText() for page in doc)
-        paragraphs = [p.strip() for p in full_text.split('\n') if p.strip()]
-        
-        # Convert tables to format expected by chunking code
-        tables_for_chunking = []
-        for table in extracted_tables:
-            if table.get("raw_data"):
-                tables_for_chunking.extend(table["raw_data"])
-
-        # Create complete metadata with all fields
-        extra_data = {
-            "file_id": file_id,
-            "paragraph_count": len(paragraphs),
-            "table_count": len(extracted_tables),
-            "word_count": len(full_text.split()),
-            "character_count": len(full_text),
-            "has_guid": True,
-            "guid_source": "pdf_metadata",
-            "DateReviewed": None,
-            "DateNext": None
-        }
-        
-        metadata = make_complete_metadata(pdf_path, extra_data)
-        
-        content = {
-            "file_id": file_id,
-            "filename": os.path.basename(pdf_path),
-            "full_path": pdf_path,
-            "subfolder": os.path.basename(os.path.dirname(pdf_path)),
-            "paragraphs": paragraphs,
-            "tables": tables_for_chunking,
-            "images": image_info,
-            "extracted_tables": extracted_tables,
-            "metadata": metadata
-        }
-        
-        doc.close()
-        return content
-    except Exception as e:
-        logger.error(f"Failed to convert {pdf_path}: {e}", exc_info=True)
-        return {"error": f"Failed to convert {pdf_path}: {str(e)}"}
-
-def convert_file_to_json(file_path):
-    _, extension = os.path.splitext(file_path)
-    extension = extension.lower()
-    
-    if extension == '.docx':
-        return docx_to_json(file_path)
-    elif extension == '.pdf':
-        return pdf_to_json(file_path)
-    else:
-        logger.warning(f"Unsupported file type: {extension} for file {file_path}")
-        return {"error": f"Unsupported file type: {extension}"}
-
-# --- Caching and File System Functions ---
-
 def find_all_supported_files():
     supported_files = []
     
@@ -623,6 +395,13 @@ def find_all_supported_files():
                     continue
     
     return supported_files
+
+def docx_to_json(docx_path: str) -> dict:
+    """Placeholder for removed native DOCX conversion function.
+    The project now uses Docling for all conversions. This stub exists
+    to keep legacy call sites from failing static analysis.
+    """
+    raise NotImplementedError("Native DOCX conversion removed; use Docling converter instead.")
 def get_cache_path(file_path):
     filename_without_ext = os.path.splitext(os.path.basename(file_path))[0]
     parent_dir = os.path.basename(os.path.dirname(file_path))
@@ -820,71 +599,7 @@ def append_image_descriptions_to_markdown(markdown_text: str, image_descs: list[
     return "\n".join(lines)
 
 # --- API Endpoints ---
-
-
-@app.route('/debug-paths', methods=['GET'])
-def debug_paths():
-    return jsonify({
-        "BASE_DIR": BASE_DIR,
-        "BASE_DIR_exists": os.path.exists(BASE_DIR),
-        "BASE_DIR_absolute": os.path.abspath(BASE_DIR),
-        "files_in_base": os.listdir(BASE_DIR) if os.path.exists(BASE_DIR) else "Directory not found"
-    })
-
-@app.route('/debug-file-search', methods=['GET'])
-def debug_file_search():
-    debug_info = {
-        "BASE_DIR": BASE_DIR,
-        "BASE_DIR_exists": os.path.exists(BASE_DIR),
-        "SUPPORTED_EXTENSIONS": SUPPORTED_EXTENSIONS,
-        "search_results": {}
-    }
-    
-    for ext in SUPPORTED_EXTENSIONS:
-        pattern = os.path.join(BASE_DIR, "**", f"*{ext}")
-        files = glob.glob(pattern, recursive=True)
-        debug_info["search_results"][ext] = {
-            "pattern": pattern,
-            "files_found": files
-        }
-    
-    # Also try manual directory walk
-    manual_files = []
-    if os.path.exists(BASE_DIR):
-        for root, dirs, files in os.walk(BASE_DIR):
-            for file in files:
-                if any(file.lower().endswith(ext.lower()) for ext in SUPPORTED_EXTENSIONS):
-                    manual_files.append(os.path.join(root, file))
-    
-    debug_info["manual_walk_results"] = manual_files
-    return jsonify(debug_info)
-
-@app.route('/ensure-guids', methods=['POST'])
-def ensure_guids():
-    """Scans all supported files and ensures that any file missing a GUID gets one."""
-    logger.info("Received request for /ensure-guids. Scanning all files.")
-    try:
-        all_files = find_all_supported_files()
-        files_updated = 0
-        
-        for file_info in all_files:
-            path = file_info['full_path']
-            if path.lower().endswith('.docx'):
-                if extract_docx_guid(path):
-                    continue  # DOCX GUIDs are read-only
-            elif path.lower().endswith('.pdf'):
-                existing_guid = read_pdf_guid(path)
-                if not existing_guid:
-                    get_or_create_pdf_guid(path)
-                    files_updated += 1
-
-        message = f"Scan complete. Updated {files_updated} PDF file(s) with a new GUID."
-        logger.info(message)
-        return jsonify({"success": True, "message": message, "files_updated": files_updated})
-
-    except Exception as e:
-        logger.error(f"An error occurred in /ensure-guids: {e}", exc_info=True)
-        return jsonify({"success": False, "error": str(e)}), 500
+# --- API Endpoints ---
 
 @app.route('/list-files', methods=['GET'])
 def list_files():
@@ -911,7 +626,7 @@ def list_files():
                         guid = extract_docx_guid(path)
                         guid_source = 'docx_settings' if guid else 'filename_fallback'
                     except Exception as e:
-                        logger.warning(f"Failed to read DOCX GUID foKr {path}: {e}")
+                        logger.warning(f"Failed to read DOCX GUID for {path}: {e}")
                     try:
                         date_reviewed, date_next = extract_custom_metadata(path)
                     except Exception:
@@ -960,6 +675,44 @@ def list_files():
     except Exception as e:
         logger.error(f"Error in /list-files: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/ensure-guids', methods=['POST'])
+def ensure_guids():
+    """Scans all supported files and ensures that any file missing a GUID gets one."""
+    logger.info("Received request for /ensure-guids. Scanning all files.")
+    try:
+        all_files = find_all_supported_files()
+        files_updated = 0
+        
+        for file_info in all_files:
+            path = file_info.get('full_path')
+            if not path:
+                continue
+            if path.lower().endswith('.docx'):
+                # DOCX GUIDs are read-only in settings.xml; skip
+                try:
+                    if extract_docx_guid(path):
+                        continue
+                except Exception as e:
+                    logger.warning(f"Failed reading DOCX GUID for {path}: {e}")
+            elif path.lower().endswith('.pdf'):
+                try:
+                    existing_guid = read_pdf_guid(path)
+                    if not existing_guid:
+                        get_or_create_pdf_guid(path)
+                        files_updated += 1
+                except Exception as e:
+                    logger.warning(f"Failed to ensure PDF GUID for {path}: {e}")
+
+        message = f"Scan complete. Updated {files_updated} PDF file(s) with a new GUID."
+        logger.info(message)
+        return jsonify({"success": True, "message": message, "files_updated": files_updated})
+
+    except Exception as e:
+        logger.error(f"An error occurred in /ensure-guids: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route('/docling/convert-file', methods=['POST'])
 def docling_convert_file():
@@ -1084,11 +837,14 @@ def docling_convert_file():
                 except Exception as e:
                     logger.warning(f"Failed to build image manifest: {e}")
 
-            # 2. Return 'Pending Approval' JSON
+            # 2. Return 'Pending' JSON
             # This stops the script here. The UI will pick this up.
+            # Status distinguishes between files with images (pending_approval) and without (pending_add)
+            status = "pending_approval" if len(image_manifest) > 0 else "pending_add"
+            
             return jsonify({
                 "success": True,
-                "status": "pending_approval",
+                "status": status,
                 "skipped": True,
                 "file_path": file_path,
                 "filename": os.path.basename(file_path),
@@ -1166,6 +922,17 @@ def docling_convert_file():
                     except Exception as e:
                         logger.warning(f"Failed to chunk DOCX: {e}")
                         chunks = []
+                # Build a summary for this conversion run
+                summary = {
+                    "total_files_processed": 1,
+                    "docx_count": 1 if ext == '.docx' else 0,
+                    "pdf_count": 1 if ext == '.pdf' else 0,
+                    # raw_total_images counted earlier; for native DOCX we expect 0
+                    "images_total": raw_total_images,
+                    "images_selected": 0,
+                    "images_analyzed": 0,
+                    "images_ignored": max(0, raw_total_images - 0)
+                }
 
                 return jsonify({
                     "success": True,
@@ -1181,7 +948,8 @@ def docling_convert_file():
                     "metadata": complete_metadata,
                     "chunks": chunks,
                     "lastModified": last_modified_iso,
-                    "createdDate": created_date_iso
+                    "createdDate": created_date_iso,
+                    "summary": summary
                 })
             except Exception as e:
                 return create_error_response(file_id, f"DOCX conversion failed: {str(e)}", "DOCX_CONVERSION_FAILED", {"exception_type": type(e).__name__})
@@ -1233,13 +1001,17 @@ def docling_convert_file():
                             "sleep_sec": float(data.get("vision_sleep_sec", 0.0)),
                         }
                         describe_kwargs = {k: v for k, v in describe_kwargs.items() if k in allowed_keys}
-                    
+
                         # Analyze images
-                        image_descs = describe_selected_images_with_openai(**describe_kwargs)
+                        try:
+                            image_descs = describe_selected_images_with_openai(**describe_kwargs)
+                        except Exception as e:
+                            logger.warning(f"Failed to analyze selected images (inner): {e}")
+                            image_descs = []
                     except Exception as e:
-                        logger.warning(f"Failed to analyze selected images: {e}")
+                        logger.warning(f"Failed to prepare or analyze selected images: {e}")
                         image_descs = []
-                    
+
                     try:
                         # Append descriptions to Markdown
                         full_text_md = append_image_descriptions_to_markdown(full_text_md, image_descs)
@@ -1309,6 +1081,19 @@ def docling_convert_file():
                 resp["image_manifest"] = selection_state.get("manifest", [])
             if image_descs:
                 resp["image_descriptions"] = image_descs
+
+            # Build a summary for this conversion run (single-file)
+            summary = {
+                "total_files_processed": 1,
+                "docx_count": 1 if ext == '.docx' else 0,
+                "pdf_count": 1 if ext == '.pdf' else 0,
+                "images_total": raw_total_images,
+                "images_selected": image_count_selected,
+                "images_analyzed": image_count_analyzed,
+                # images ignored = images not analyzed (best-effort)
+                "images_ignored": max(0, raw_total_images - image_count_analyzed)
+            }
+            resp["summary"] = summary
 
             return jsonify(resp)
 
@@ -1396,106 +1181,6 @@ def image_selection_get():
         "created_at": state.get("created_at")
     })
 
-@app.route('/docling/convert-all', methods=['POST'])
-def docling_convert_all():
-    """
-    Batch-convert all supported files under BASE_DIR using the Docling path.
-    Gracefully skips corrupt/unreadable files and continues with the next.
-    Returns detailed results for each file processed.
-    """
-    results = {
-        "total_files": 0,
-        "successful": 0,
-        "failed": 0,
-        "skipped": 0,
-        "file_results": []
-    }
-    
-    try:
-        files = find_all_supported_files()
-        results["total_files"] = len(files)
-        
-        for file_info in files:
-            path = file_info.get("full_path")
-            if not path:
-                logger.warning("Skipping file with no path in file_info")
-                continue
-            
-            file_result = {
-                "file_path": path,
-                "filename": os.path.basename(path),
-                "status": "pending",
-                "success": False,
-                "error": None,
-                "error_type": None
-            }
-            
-            try:
-                # Validate file existence and readability
-                if not os.path.exists(path):
-                    file_result["status"] = "skipped"
-                    file_result["error"] = "File not found"
-                    file_result["error_type"] = "FILE_NOT_FOUND"
-                    results["skipped"] += 1
-                    results["file_results"].append(file_result)
-                    logger.warning(f"Skipping: file not found: {path}")
-                    continue
-                
-                # Check file is readable
-                if not os.access(path, os.R_OK):
-                    file_result["status"] = "skipped"
-                    file_result["error"] = "File is not readable"
-                    file_result["error_type"] = "PERMISSION_ERROR"
-                    results["skipped"] += 1
-                    results["file_results"].append(file_result)
-                    logger.warning(f"Skipping: permission denied: {path}")
-                    continue
-                
-                # Attempt conversion
-                try:
-                    logger.info(f"Converting: {path}")
-                    conversion_result = docling_converter.convert(path)
-                    
-                    file_result["status"] = "completed"
-                    file_result["success"] = True
-                    file_result["conversion_status"] = str(conversion_result.status)
-                    results["successful"] += 1
-                    logger.info(f"Successfully converted: {path}")
-                    
-                except Exception as convert_error:
-                    file_result["status"] = "failed"
-                    file_result["success"] = False
-                    file_result["error"] = str(convert_error)
-                    file_result["error_type"] = type(convert_error).__name__
-                    results["failed"] += 1
-                    logger.error(f"Conversion failed for {path}: {convert_error}")
-            
-            except Exception as file_error:
-                file_result["status"] = "error"
-                file_result["success"] = False
-                file_result["error"] = str(file_error)
-                file_result["error_type"] = type(file_error).__name__
-                results["failed"] += 1
-                logger.error(f"Error processing {path}: {file_error}", exc_info=True)
-            
-            finally:
-                results["file_results"].append(file_result)
-        
-        # Summary response
-        return jsonify({
-            "success": True,
-            "message": f"Batch conversion complete: {results['successful']} succeeded, {results['failed']} failed, {results['skipped']} skipped",
-            "results": results
-        }), 200
-    
-    except Exception as e:
-        logger.error(f"Error in batch conversion: {e}", exc_info=True)
-        return jsonify({
-            "success": False,
-            "error": f"Batch conversion error: {str(e)}",
-            "error_type": type(e).__name__,
-            "results": results
-        }), 200  # Still return 200 even on batch-level error, with partial results
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=False)
