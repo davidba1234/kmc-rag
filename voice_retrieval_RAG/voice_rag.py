@@ -62,13 +62,45 @@ def record_audio_manual(filename=WAVE_OUTPUT_FILENAME):
     # Let's implement a simpler "Record for 5 seconds" for now to test.
     pass
 
+def check_audio_device():
+    """Checks if a valid audio input device is available."""
+    try:
+        p = pyaudio.PyAudio()
+        # Try to open a stream just to check
+        stream = p.open(format=FORMAT, channels=CHANNELS, rate=RECORD_RATE, input=True, frames_per_buffer=CHUNK)
+        stream.close()
+        p.terminate()
+        return True
+    except Exception as e:
+        # print(f"⚠️ Audio device check failed: {e}")
+        return False
+
+def get_user_input(use_voice=True):
+    """Gets input from user via voice (if available) or text."""
+    if use_voice:
+        try:
+            print("\nPress Enter to start recording (or Ctrl+C to exit)...")
+            input() # Wait for enter
+            audio_file = record_audio_fixed(duration=5)
+            return transcribe_audio(audio_file)
+        except (OSError, Exception) as e:
+            print(f"\n⚠️ Audio recording failed (No microphone detected?): {e}")
+            print("➡️ Switching to text input mode.")
+            return input("\n⌨️ Type your query: ")
+    else:
+        return input("\n⌨️ Type your query: ")
+
 def record_audio_fixed(filename=WAVE_OUTPUT_FILENAME, duration=5):
     p = pyaudio.PyAudio()
-    stream = p.open(format=FORMAT,
-                    channels=CHANNELS,
-                    rate=RECORD_RATE,
-                    input=True,
-                    frames_per_buffer=CHUNK)
+    try:
+        stream = p.open(format=FORMAT,
+                        channels=CHANNELS,
+                        rate=RECORD_RATE,
+                        input=True,
+                        frames_per_buffer=CHUNK)
+    except OSError as e:
+        p.terminate()
+        raise e # Re-raise to be caught by get_user_input
 
     print(f"\n🔴 Recording for {duration} seconds...")
     frames = []
@@ -93,12 +125,16 @@ def record_audio_fixed(filename=WAVE_OUTPUT_FILENAME, duration=5):
 
 def transcribe_audio(filename):
     print("📝 Transcribing...")
-    with open(filename, "rb") as audio_file:
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1", 
-            file=audio_file
-        )
-    return transcript.text
+    try:
+        with open(filename, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1", 
+                file=audio_file
+            )
+        return transcript.text
+    except Exception as e:
+        print(f"❌ Transcription failed: {e}")
+        return ""
 
 def generate_response(query, context_chunks):
     print("🧠 Generating response...")
@@ -123,57 +159,70 @@ def generate_response(query, context_chunks):
 
 def speak_text(text):
     print("🔊 Speaking...")
-    response = client.audio.speech.create(
-        model="tts-1",
-        voice="alloy",
-        input=text,
-        response_format="pcm" # Raw PCM data
-    )
-    
-    # Play audio using PyAudio
-    p = pyaudio.PyAudio()
-    stream = p.open(format=pyaudio.paInt16, 
-                    channels=1, 
-                    rate=24000, 
-                    output=True)
-    
-    # Stream the response
-    for chunk in response.iter_bytes(chunk_size=1024):
-        stream.write(chunk)
+    try:
+        response = client.audio.speech.create(
+            model="tts-1",
+            voice="alloy",
+            input=text,
+            response_format="pcm" # Raw PCM data
+        )
         
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
+        # Play audio using PyAudio
+        p = pyaudio.PyAudio()
+        stream = p.open(format=pyaudio.paInt16, 
+                        channels=1, 
+                        rate=24000, 
+                        output=True)
+        
+        # Stream the response
+        for chunk in response.iter_bytes(chunk_size=1024):
+            stream.write(chunk)
+            
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+    except Exception as e:
+        print(f"⚠️ Audio playback failed (No speakers detected?): {e}")
+        print(f"🤖 AI Response: {text}")
 
 def main():
+    # Initial check
+    audio_available = check_audio_device()
+    if not audio_available:
+        print("⚠️ No audio input device detected. Defaulting to text mode.")
+    
     while True:
-        input("\nPress Enter to start recording (or Ctrl+C to exit)...")
-        
-        # 1. Record
-        audio_file = record_audio_fixed(duration=5)
-        
-        # 2. Transcribe
-        text = transcribe_audio(audio_file)
-        print(f"🗣️ You said: {text}")
-        
-        if not text.strip():
-            print("No speech detected.")
-            continue
-
-        # 3. Retrieve
-        context = retrieve_and_rerank(text)
-        
-        if not context:
-            print("No relevant context found.")
-            response_text = "I couldn't find any information about that in the database."
-        else:
-            # 4. Generate
-            response_text = generate_response(text, context)
+        try:
+            # 1. Get Input (Voice or Text)
+            text = get_user_input(use_voice=audio_available)
             
-        print(f"🤖 AI: {response_text}")
-        
-        # 5. Speak
-        speak_text(response_text)
+            if not text or not text.strip():
+                print("No input detected.")
+                continue
+                
+            print(f"🗣️ User: {text}")
+
+            # 3. Retrieve
+            context = retrieve_and_rerank(text)
+            
+            if not context:
+                print("No relevant context found.")
+                response_text = "I couldn't find any information about that in the database."
+            else:
+                # 4. Generate
+                response_text = generate_response(text, context)
+                
+            print(f"🤖 AI: {response_text}")
+            
+            # 5. Speak (or just print if audio fails)
+            speak_text(response_text)
+            
+        except KeyboardInterrupt:
+            print("\nExiting...")
+            break
+        except Exception as e:
+            print(f"\n❌ An error occurred: {e}")
+            break
 
 if __name__ == "__main__":
     main()
