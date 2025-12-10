@@ -2,3 +2,5 @@ supabase
 flashrank
 openai
 python-dotenv
+pyaudio
+
