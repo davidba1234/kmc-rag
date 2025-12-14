@@ -3,6 +3,8 @@ import time
 import wave
 import pyaudio
 import json
+import audioop
+import math
 from openai import OpenAI
 from dotenv import load_dotenv
 from retrieval import retrieve_and_rerank
@@ -81,7 +83,7 @@ def get_user_input(use_voice=True):
         try:
             print("\nPress Enter to start recording (or Ctrl+C to exit)...")
             input() # Wait for enter
-            audio_file = record_audio_fixed(duration=5)
+            audio_file = record_audio_smart()
             return transcribe_audio(audio_file)
         except (OSError, Exception) as e:
             print(f"\n⚠️ Audio recording failed (No microphone detected?): {e}")
@@ -90,35 +92,42 @@ def get_user_input(use_voice=True):
     else:
         return input("\n⌨️ Type your query: ")
 
-def record_audio_fixed(filename=WAVE_OUTPUT_FILENAME, duration=5):
+def record_audio_smart(filename="input.wav", threshold=1000, silence_limit=1.5):
+    """Records until silence is detected for 'silence_limit' seconds."""
     p = pyaudio.PyAudio()
-    try:
-        stream = p.open(format=FORMAT,
-                        channels=CHANNELS,
-                        rate=RECORD_RATE,
-                        input=True,
-                        frames_per_buffer=CHUNK)
-    except OSError as e:
-        p.terminate()
-        raise e # Re-raise to be caught by get_user_input
+    stream = p.open(format=pyaudio.paInt16, channels=1, rate=44100, input=True, frames_per_buffer=1024)
 
-    print(f"\n🔴 Recording for {duration} seconds...")
+    print("🔴 Listening... (Speak now)")
     frames = []
-
-    for i in range(0, int(RECORD_RATE / CHUNK * duration)):
-        data = stream.read(CHUNK)
+    silent_chunks = 0
+    speaking_started = False
+    
+    while True:
+        data = stream.read(1024)
         frames.append(data)
-
-    print("⏹️ Recording finished.")
-
+        
+        # Calculate volume
+        rms = audioop.rms(data, 2)
+        
+        if rms > threshold:
+            speaking_started = True
+            silent_chunks = 0
+        elif speaking_started:
+            silent_chunks += 1
+            # 44100 Hz / 1024 samples per chunk ≈ 43 chunks per second
+            if silent_chunks > (43 * silence_limit): 
+                print("⏹️ Silence detected, stopping.")
+                break
+    
     stream.stop_stream()
     stream.close()
     p.terminate()
-
+    
+    # Save file (same as your original code)
     wf = wave.open(filename, 'wb')
-    wf.setnchannels(CHANNELS)
-    wf.setsampwidth(p.get_sample_size(FORMAT))
-    wf.setframerate(RECORD_RATE)
+    wf.setnchannels(1)
+    wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
+    wf.setframerate(44100)
     wf.writeframes(b''.join(frames))
     wf.close()
     return filename
@@ -152,7 +161,7 @@ def generate_response(query, context_chunks):
     ]
     
     response = client.chat.completions.create(
-        model="gpt-4o", # Or gpt-3.5-turbo
+        model="gpt-4o-mini", # Or gpt-3.5-turbo
         messages=messages
     )
     return response.choices[0].message.content
