@@ -717,48 +717,94 @@ def ensure_guids():
 @app.route('/docling/convert-file', methods=['POST'])
 def docling_convert_file():
     """
-    Convert a single file (DOCX or PDF) using its fileID as the unique identifier.
+    Convert a single file (DOCX or PDF) using its fileID as the unique identifier,
+    or accept a direct file upload.
     Returns 200 OK with error flag on failure, allowing n8n to skip and continue.
     """
     file_id = None
     file_path = None
+    temp_file_path = None
+    is_upload = False
+
     try:
-        # ===== STEP 1: Parse request =====
-        try:
-            data = request.get_json(force=True)
-            if not data or 'file_id' not in data:
-                return jsonify({"error": "Missing 'file_id' in JSON request body"}), 400
-            file_id = data['file_id']
-        except Exception as e:
-            return jsonify({"error": f"Invalid request: {str(e)}"}), 400
-        
-        # ===== STEP 2: Resolve fileID to file_path (with auto-register fallback) =====
-        try:
-            file_path = resolve_file_path(file_id)
+        # ===== STEP 1: Determine input method =====
+        # Check if a file was uploaded
+        uploaded_file = request.files.get('file')
+        # FIX: Check if we have a file, even if the filename is generic/missing
+        if uploaded_file:
+            is_upload = True
             
-            # If not in registry, try to find file by ID and auto-register
-            if not file_path:
-                # Look for a file that matches this ID (could be from external source)
-                # This supports calling convert-file with an ID even if list-files wasn't called first
-                all_files = find_all_supported_files()
-                for file_info in all_files:
-                    candidate_path = file_info['full_path']
-                    # Get the ID that would be assigned to this file
-                    candidate_id = get_file_id_or_register(candidate_path)
-                    if candidate_id == file_id:
-                        file_path = candidate_path
-                        break
-                
+            # 1. Try to get real filename from the 'data' JSON field first
+            json_data = {}
+            raw_data = request.form.get('data')
+            if raw_data:
+                try:
+                    json_data = json.loads(raw_data)
+                except Exception as e:
+                    logger.warning(f"Failed to parse 'data' form field: {e}")
+
+            # 2. Use the explicitly provided filename, or fallback to the upload object
+            filename = json_data.get('filename') or uploaded_file.filename or "unknown_file"
+            
+            logger.info(f"Processing uploaded file. Detected filename: {filename}")
+
+            # 3. Validate file extension
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in SUPPORTED_EXTENSIONS:
+                return create_error_response(filename, f"Unsupported file type: {ext} (derived from {filename})", "UNSUPPORTED_FORMAT")
+
+            # Save uploaded file to temporary location
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
+                    uploaded_file.save(temp_file.name)
+                    temp_file_path = temp_file.name
+                    file_path = temp_file_path
+
+                # Generate file_id for uploaded file
+                file_id = str(uuid.uuid4())
+                logger.info(f"Generated file_id for upload: {file_id}")
+
+            except Exception as e:
+                return create_error_response(filename, f"Failed to save uploaded file: {str(e)}", "FILE_SAVE_ERROR")
+
+        else:
+            # Original file_id based processing
+            try:
+                data = request.get_json(force=True)
+                if not data or 'file_id' not in data:
+                    return jsonify({"error": "Missing 'file_id' in JSON request body or 'file' in form data"}), 400
+                file_id = data['file_id']
+            except Exception as e:
+                return jsonify({"error": f"Invalid request: {str(e)}"}), 400
+
+            # ===== STEP 2: Resolve fileID to file_path (with auto-register fallback) =====
+            try:
+                file_path = resolve_file_path(file_id)
+
+                # If not in registry, try to find file by ID and auto-register
                 if not file_path:
-                    return create_error_response(file_id, f"FileID not found and could not locate matching file: {file_id}", "FILE_ID_NOT_FOUND")
-        except Exception as e:
-            return create_error_response(file_id, f"Failed to resolve fileID: {str(e)}", "FILE_ID_RESOLUTION_ERROR")
+                    # Look for a file that matches this ID (could be from external source)
+                    # This supports calling convert-file with an ID even if list-files wasn't called first
+                    all_files = find_all_supported_files()
+                    for file_info in all_files:
+                        candidate_path = file_info['full_path']
+                        # Get the ID that would be assigned to this file
+                        candidate_id = get_file_id_or_register(candidate_path)
+                        if candidate_id == file_id:
+                            file_path = candidate_path
+                            break
+
+                    if not file_path:
+                        return create_error_response(file_id, f"FileID not found and could not locate matching file: {file_id}", "FILE_ID_NOT_FOUND")
+            except Exception as e:
+                return create_error_response(file_id, f"Failed to resolve fileID: {str(e)}", "FILE_ID_RESOLUTION_ERROR")
         
         # ===== STEP 3: Validate file path =====
         try:
             if not os.path.exists(file_path):
                 return create_error_response(file_id, f"File not found: {file_path}", "FILE_NOT_FOUND")
-            if not os.path.abspath(file_path).startswith(os.path.abspath(BASE_DIR)):
+            # Only check BASE_DIR security for non-uploaded files
+            if not is_upload and not os.path.abspath(file_path).startswith(os.path.abspath(BASE_DIR)):
                 return create_error_response(file_id, "File path is outside allowed directory", "SECURITY_ERROR")
         except Exception as e:
             return create_error_response(file_id, f"Failed to validate file path: {str(e)}", "PATH_VALIDATION_ERROR")
@@ -778,10 +824,31 @@ def docling_convert_file():
             created_date_iso = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat()
         except Exception as e:
             logger.warning(f"Failed to stat file for timestamps: {e}")
-            last_modified_iso = None
-            created_date_iso = None
+            # For uploaded files, use current time
+            if is_upload:
+                now = datetime.now(timezone.utc)
+                last_modified_iso = now.isoformat()
+                created_date_iso = now.isoformat()
+            else:
+                last_modified_iso = None
+                created_date_iso = None
 
-        # [Existing Params]
+        # [Existing Params] - get from JSON data if present
+        data = {}
+        if not is_upload:
+            try:
+                data = request.get_json(force=True) or {}
+            except:
+                data = {}
+        else:
+            # For uploads, check if additional JSON data was sent
+            json_data = request.form.get('data')
+            if json_data:
+                try:
+                    data = json.loads(json_data)
+                except:
+                    data = {}
+
         force_refresh = data.get("force_refresh", False)
         do_chunking = data.get("do_chunking", False)
         chunking_options = data.get("chunking_options", {})
@@ -846,13 +913,14 @@ def docling_convert_file():
                 "success": True,
                 "status": status,
                 "skipped": True,
-                "file_path": file_path,
+                "file_path": file_path if not is_upload else None,  # Don't expose temp path
                 "filename": os.path.basename(file_path),
                 "lastModified": last_modified_iso,
                 "createdDate": created_date_iso,
                 "file_id": file_id,
                 "image_count_total": raw_total_images,
-                
+                "is_upload": is_upload,
+
                 # Image Selection Data
                 "needs_image_selection": (len(image_manifest) > 0),
                 "image_manifest": image_manifest,
@@ -1037,12 +1105,13 @@ def docling_convert_file():
                 "word_count": len(full_text_md.split()) if full_text_md else 0,
                 "character_count": len(full_text_md) if full_text_md else 0,
                 "has_guid": True,
-                "guid_source": "file_id",
+                "guid_source": "upload" if is_upload else "file_id",
                 "ai_title": ai_title,
                 "ai_description": ai_description,
                 "image_count_total": raw_total_images,
                 "image_count_selected": image_count_selected,
                 "image_count_analyzed": image_count_analyzed,
+                "is_upload": is_upload,
                 **extra_meta,
             }
 
@@ -1066,13 +1135,14 @@ def docling_convert_file():
                 "success": True,
                 "used_converter": "docling",
                 "file_id": file_id,
-                "file_path": file_path,
+                "file_path": file_path if not is_upload else None,  # Don't expose temp path
                 "filename": os.path.basename(file_path),
                 "conversion_status": str(conversion_result.status) if conversion_result else "unknown",
                 "document": document_dict,
                 "full_text": full_text_md,
                 "metadata": complete_metadata,
-                "chunks": chunks
+                "chunks": chunks,
+                "is_upload": is_upload
             }
             # Include timestamps at top-level for easy access
             resp["lastModified"] = last_modified_iso
@@ -1104,6 +1174,15 @@ def docling_convert_file():
         # Catch-all for any unexpected errors
         logger.error(f"Unexpected error in docling_convert_file: {e}", exc_info=True)
         return create_error_response(file_id or "unknown", f"Unexpected server error: {str(e)}", "UNEXPECTED_ERROR", {"exception_type": type(e).__name__})
+
+    finally:
+        # Clean up temporary file if it was created
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.unlink(temp_file_path)
+                logger.info(f"Cleaned up temporary file: {temp_file_path}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary file {temp_file_path}: {e}")
 
 @app.route('/file-id/resolve', methods=['GET'])
 def resolve_file_endpoint():
