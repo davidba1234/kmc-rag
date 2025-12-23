@@ -777,6 +777,9 @@ def docling_convert_file():
             except Exception as e:
                 return jsonify({"error": f"Invalid request: {str(e)}"}), 400
 
+            # Initialize filename for non-upload case
+            filename = data.get('filename') or "unknown_file"
+
             # ===== STEP 2: Resolve fileID to file_path (with auto-register fallback) =====
             try:
                 file_path = resolve_file_path(file_id)
@@ -798,6 +801,9 @@ def docling_convert_file():
                         return create_error_response(file_id, f"FileID not found and could not locate matching file: {file_id}", "FILE_ID_NOT_FOUND")
             except Exception as e:
                 return create_error_response(file_id, f"Failed to resolve fileID: {str(e)}", "FILE_ID_RESOLUTION_ERROR")
+            
+            if filename == "unknown_file" and file_path:
+                filename = os.path.basename(file_path)
         
         # ===== STEP 3: Validate file path =====
         try:
@@ -1124,6 +1130,9 @@ def docling_convert_file():
                 extra_data.update(origin_meta_raw)
             elif origin_meta_raw:
                 extra_data["origin"] = str(origin_meta_raw)
+            
+            # Ensure correct filename is used, overriding any origin metadata
+            extra_data["filename"] = filename
 
             complete_metadata = make_complete_metadata(file_path, extra_data)
             
