@@ -866,6 +866,9 @@ def docling_convert_file():
         selection_token = data.get("selection_token")
         selected_image_ids = data.get("selected_image_ids", []) or []
 
+        user_provided_path = data.get('file_path')
+        user_provided_subfolder = data.get('subfolder')
+
         # ===== STEP 6: Count images (PDF & DOCX) =====
         # Fast pre-check to see what we are dealing with
         raw_total_images = 0
@@ -919,11 +922,15 @@ def docling_convert_file():
             # Status distinguishes between files with images (pending_approval) and without (pending_add)
             status = "pending_approval" if len(image_manifest) > 0 else "pending_add"
             
+            # Determine return path: user provided > real path (if not upload) > None
+            return_path = user_provided_path if user_provided_path else (file_path if not is_upload else None)
+
             return jsonify({
                 "success": True,
                 "status": status,
                 "skipped": True,
-                "file_path": file_path if not is_upload else None,  # Don't expose temp path
+                "file_path": return_path,
+                "subfolder": user_provided_subfolder, # Include subfolder if available
                 "filename": filename,
                 "lastModified": last_modified_iso,
                 "createdDate": created_date_iso,
@@ -992,6 +999,13 @@ def docling_convert_file():
                     "image_count_selected": 0,
                     "image_count_analyzed": 0,
                 }
+                
+                # Override path/subfolder if provided
+                if user_provided_path:
+                    extra_data["full_path"] = user_provided_path
+                if user_provided_subfolder:
+                    extra_data["subfolder"] = user_provided_subfolder
+
                 complete_metadata = make_complete_metadata(file_path, extra_data)
                 chunks = []
                 if do_chunking:
@@ -1015,7 +1029,7 @@ def docling_convert_file():
                 return jsonify({
                     "success": True,
                     "used_converter": "native_docx",
-                    "file_path": file_path,
+                    "file_path": user_provided_path if user_provided_path else file_path,
                     "filename": content.get("filename"),
                     "full_text": full_text,
                     "structured_content": {
@@ -1133,6 +1147,12 @@ def docling_convert_file():
             
             # Ensure correct filename is used, overriding any origin metadata
             extra_data["filename"] = filename
+            
+            # Override path/subfolder if provided
+            if user_provided_path:
+                extra_data["full_path"] = user_provided_path
+            if user_provided_subfolder:
+                extra_data["subfolder"] = user_provided_subfolder
 
             complete_metadata = make_complete_metadata(file_path, extra_data)
             
@@ -1148,7 +1168,7 @@ def docling_convert_file():
                 "success": True,
                 "used_converter": "docling",
                 "file_id": file_id,
-                "file_path": file_path if not is_upload else None,  # Don't expose temp path
+                "file_path": user_provided_path if user_provided_path else (file_path if not is_upload else None),
                 "filename": filename,
                 "conversion_status": str(conversion_result.status) if conversion_result else "unknown",
                 "document": document_dict,
