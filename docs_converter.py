@@ -36,7 +36,7 @@ except Exception:
 
 # --- Basic Configuration ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("flask_app.log"),
@@ -848,6 +848,10 @@ def docling_convert_file():
                     data = json.loads(json_data)
                 except:
                     data = {}
+            
+            logger.debug(f"Request form keys: {list(request.form.keys())}")
+            logger.debug(f"Raw data field: {request.form.get('data')}")
+            logger.debug(f"Parsed data: {data}")
 
         force_refresh = data.get("force_refresh", False)
         do_chunking = data.get("do_chunking", False)
@@ -914,7 +918,7 @@ def docling_convert_file():
                 "status": status,
                 "skipped": True,
                 "file_path": file_path if not is_upload else None,  # Don't expose temp path
-                "filename": os.path.basename(file_path),
+                "filename": filename,
                 "lastModified": last_modified_iso,
                 "createdDate": created_date_iso,
                 "file_id": file_id,
@@ -1136,7 +1140,7 @@ def docling_convert_file():
                 "used_converter": "docling",
                 "file_id": file_id,
                 "file_path": file_path if not is_upload else None,  # Don't expose temp path
-                "filename": os.path.basename(file_path),
+                "filename": filename,
                 "conversion_status": str(conversion_result.status) if conversion_result else "unknown",
                 "document": document_dict,
                 "full_text": full_text_md,
