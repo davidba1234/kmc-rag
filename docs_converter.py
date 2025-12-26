@@ -64,7 +64,7 @@ FILE_PATH_CACHE = {}  # Maps file_path -> fileID for reverse lookups
 ALL_METADATA_FIELDS = [
     "file_id",
     "filename",
-    "full_path",
+    "file_path",
     "subfolder",
     "file_extension",
     "file_size",
@@ -187,6 +187,7 @@ def make_complete_metadata(file_path, extra_data=None):
     # Base metadata that's always available
     metadata = {
         "filename": filename,
+        "file_path": file_path,
         "subfolder": parent_dir,
         "file_extension": ext,
         "file_size": file_stats.st_size,
@@ -663,7 +664,7 @@ def list_files():
                 # Fallback minimal entry so list remains stable
                 enriched_files.append({
                     'filename': os.path.basename(path) if path else None,
-                    'full_path': path,
+                    'file_path': path,
                     'file_id': None,
                     'lastModified': None,
                     'createdDate': None
@@ -1005,7 +1006,7 @@ def docling_convert_file():
                 
                 # Override path/subfolder if provided
                 if user_provided_path:
-                    pass # full_path removed
+                    extra_data["file_path"] = user_provided_path
                 if user_provided_subfolder:
                     extra_data["subfolder"] = user_provided_subfolder
 
@@ -1153,7 +1154,7 @@ def docling_convert_file():
             
             # Override path/subfolder if provided
             if user_provided_path:
-                pass # full_path removed
+                extra_data["file_path"] = user_provided_path
             if user_provided_subfolder:
                 extra_data["subfolder"] = user_provided_subfolder
 

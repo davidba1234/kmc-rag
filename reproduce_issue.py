@@ -182,7 +182,7 @@ class TestFilePathMetadata(unittest.TestCase):
             
             # Verify metadata
             metadata = json_response.get('metadata', {})
-            self.assertEqual(metadata.get('full_path'), target_path, "Metadata full_path should match provided path")
+            self.assertEqual(metadata.get('file_path'), target_path, "Metadata file_path should match provided path")
             self.assertEqual(metadata.get('subfolder'), target_subfolder, "Metadata subfolder should match provided subfolder")
             
 if __name__ == '__main__':

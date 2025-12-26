@@ -10,8 +10,6 @@ explain th parameters that the api convert-file accepts. When it is actually con
 
 *Grep searched codebase*
 
-*Grep searched codebase*
-
 *Viewed [docs_converter.py](file://wsl.localhost/Ubuntu/home/dba/kmc-rag/docs_converter.py) *
 
 ### Planner Response
