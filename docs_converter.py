@@ -912,8 +912,10 @@ def docling_convert_file():
                         selection_token = hashlib.sha256(token_seed.encode("utf-8")).hexdigest()[:32]
                         
                         # Save state so we can retrieve these specific images later
+                        # FIX: Use user_provided_path if available, as it is stable across uploads
+                        stable_path = user_provided_path if user_provided_path else file_path
                         save_selection_state(selection_token, {
-                            "file_path": file_path,
+                            "file_path": stable_path,
                             "file_id": file_id,
                             "manifest": image_manifest,
                             "created_at": datetime.now(timezone.utc).isoformat()
@@ -1083,8 +1085,12 @@ def docling_convert_file():
                         return create_error_response(file_id, "selection_token is required when image_mode='selected'", "MISSING_TOKEN")
                     
                     selection_state = load_selection_state(selection_token)
-                    if not selection_state or selection_state.get("file_path") != file_path:
-                        return create_error_response(file_id, "Invalid or expired selection_token", "INVALID_TOKEN")
+                    
+                    # FIX: Compare against user_provided_path if available (stable), else physical path
+                    current_stable_path = user_provided_path if user_provided_path else file_path
+                    
+                    if not selection_state or selection_state.get("file_path") != current_stable_path:
+                        return create_error_response(file_id, f"Invalid or expired selection_token. Expected path: {selection_state.get('file_path')}, Got: {current_stable_path}", "INVALID_TOKEN")
 
                     try:
                         allowed_keys = {"pdf_path", "selection_state", "selected_ids", "model", "per_image_max_tokens", "sleep_sec"}
