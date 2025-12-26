@@ -1103,8 +1103,9 @@ def docling_convert_file():
                     # FIX: Compare against user_provided_path if available (stable), else physical path
                     current_stable_path = user_provided_path if user_provided_path else file_path
                     
-                    if not selection_state or selection_state.get("file_path") != current_stable_path:
-                        return create_error_response(file_id, f"Invalid or expired selection_token. Expected path: {selection_state.get('file_path')}, Got: {current_stable_path}", "INVALID_TOKEN")
+                    expected_path = selection_state.get("file_path") if selection_state else "Unknown (Token not found)"
+                    if not selection_state or expected_path != current_stable_path:
+                        return create_error_response(file_id, f"Invalid or expired selection_token. Expected path: {expected_path}, Got: {current_stable_path}", "INVALID_TOKEN")
 
                     try:
                         allowed_keys = {"pdf_path", "selection_state", "selected_ids", "model", "per_image_max_tokens", "sleep_sec"}
