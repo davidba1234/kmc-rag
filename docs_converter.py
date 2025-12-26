@@ -187,7 +187,6 @@ def make_complete_metadata(file_path, extra_data=None):
     # Base metadata that's always available
     metadata = {
         "filename": filename,
-        "full_path": file_path,
         "subfolder": parent_dir,
         "file_extension": ext,
         "file_size": file_stats.st_size,
@@ -868,6 +867,10 @@ def docling_convert_file():
 
         user_provided_path = data.get('file_path')
         user_provided_subfolder = data.get('subfolder')
+        
+        logger.debug(f"Extracted user_provided_path: {user_provided_path}")
+        logger.debug(f"Extracted user_provided_subfolder: {user_provided_subfolder}")
+        logger.debug(f"Data keys available: {list(data.keys())}")
 
         # ===== STEP 6: Count images (PDF & DOCX) =====
         # Fast pre-check to see what we are dealing with
@@ -1002,7 +1005,7 @@ def docling_convert_file():
                 
                 # Override path/subfolder if provided
                 if user_provided_path:
-                    extra_data["full_path"] = user_provided_path
+                    pass # full_path removed
                 if user_provided_subfolder:
                     extra_data["subfolder"] = user_provided_subfolder
 
@@ -1150,7 +1153,7 @@ def docling_convert_file():
             
             # Override path/subfolder if provided
             if user_provided_path:
-                extra_data["full_path"] = user_provided_path
+                pass # full_path removed
             if user_provided_subfolder:
                 extra_data["subfolder"] = user_provided_subfolder
 
