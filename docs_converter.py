@@ -38,14 +38,26 @@ except Exception:
 BASE_DIR = "/mnt/c/Users/Anderson/Documents/n8n/kmc-rag/test_docs"
 print(f"BASE_DIR is set to: {BASE_DIR}")
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(os.path.join(BASE_DIR, "flask_app.log")),
-        logging.StreamHandler()
-    ]
-)
+# Force root logger configuration
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+
+# Clear existing handlers to avoid duplicates
+if root_logger.hasHandlers():
+    root_logger.handlers.clear()
+
+# Create handlers
+file_handler = logging.FileHandler(os.path.join(BASE_DIR, "flask_app.log"))
+stream_handler = logging.StreamHandler()
+
+# Set formatter
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+stream_handler.setFormatter(formatter)
+
+# Add handlers
+root_logger.addHandler(file_handler)
+root_logger.addHandler(stream_handler)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
