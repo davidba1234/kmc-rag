@@ -35,11 +35,14 @@ except Exception:
 
 
 # --- Basic Configuration ---
+BASE_DIR = "/mnt/c/Users/Anderson/Documents/n8n/kmc-rag/test_docs"
+print(f"BASE_DIR is set to: {BASE_DIR}")
+
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("flask_app.log"),
+        logging.FileHandler(os.path.join(BASE_DIR, "flask_app.log")),
         logging.StreamHandler()
     ]
 )
@@ -47,8 +50,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-BASE_DIR = "/mnt/c/Users/Anderson/Documents/n8n/kmc-rag/test_docs"
-print(f"BASE_DIR is set to: {BASE_DIR}")
+JSON_CACHE_DIR = os.path.join(BASE_DIR, "json_cache")
 JSON_CACHE_DIR = os.path.join(BASE_DIR, "json_cache")
 IMAGE_OUTPUT_DIR = os.path.join(BASE_DIR, "image_output")
 os.makedirs(JSON_CACHE_DIR, exist_ok=True)
