@@ -1222,8 +1222,11 @@ def docling_convert_file():
                     logger.warning(f"Failed to chunk document: {e}")
                     chunks = []
 
+            # Determine overall success based on image processing errors
+            overall_success = not image_processing_error
+
             resp = {
-                "success": True,
+                "success": overall_success,
                 "used_converter": "docling",
                 "file_id": file_id,
                 "file_path": user_provided_path if user_provided_path else (file_path if not is_upload else None),
@@ -1245,6 +1248,9 @@ def docling_convert_file():
 
             # Include image processing error information if any occurred
             if image_processing_error:
+                resp["error"] = True
+                resp["error_type"] = image_processing_error_type
+                resp["error_message"] = image_processing_error
                 resp["image_processing_error"] = image_processing_error
                 resp["image_processing_error_type"] = image_processing_error_type
 
