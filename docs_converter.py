@@ -873,6 +873,11 @@ def docling_convert_file():
             logger.debug(f"Raw data field: {request.form.get('data')}")
             logger.debug(f"Parsed data: {data}")
 
+            # Use file_id from JSON data if provided (for uploads in selected mode)
+            if data.get('file_id'):
+                file_id = data['file_id']
+                logger.info(f"Using file_id from JSON data: {file_id}")
+
         force_refresh = data.get("force_refresh", False)
         do_chunking = data.get("do_chunking", False)
         chunking_options = data.get("chunking_options", {})
