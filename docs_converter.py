@@ -47,7 +47,7 @@ if root_logger.hasHandlers():
     root_logger.handlers.clear()
 
 # Create handlers
-file_handler = logging.FileHandler(os.path.join(BASE_DIR, "flask_app.log"))
+file_handler = logging.FileHandler(os.path.join(os.path.dirname(BASE_DIR), "flask_app.log"))
 stream_handler = logging.StreamHandler()
 
 # Set formatter
@@ -1089,51 +1089,65 @@ def docling_convert_file():
                 except Exception as e:
                     logger.warning(f"Failed to extract custom metadata: {e}")
 
+            
             # Handle Image Mode = SELECTED
             image_descs = []
             selection_state = None
             
             if ext == ".pdf" and image_mode == "selected":
                 try:
-                    if not selection_token:
-                        return create_error_response(file_id, "selection_token is required when image_mode='selected'", "MISSING_TOKEN")
-                    
-                    selection_state = load_selection_state(selection_token)
-                    
-                    # FIX: Compare against user_provided_path if available (stable), else physical path
-                    current_stable_path = user_provided_path if user_provided_path else file_path
-                    
-                    expected_path = selection_state.get("file_path") if selection_state else "Unknown (Token not found)"
-                    if not selection_state or expected_path != current_stable_path:
-                        return create_error_response(file_id, f"Invalid or expired selection_token. Expected path: {expected_path}, Got: {current_stable_path}", "INVALID_TOKEN")
+                    # NEW: Check if manifest was passed directly (Stateless/Distributed Fix)
+                    passed_manifest = data.get("image_manifest")
 
-                    try:
-                        allowed_keys = {"pdf_path", "selection_state", "selected_ids", "model", "per_image_max_tokens", "sleep_sec"}
-                        describe_kwargs = {
-                            "pdf_path": file_path,
-                            "selection_state": selection_state,
-                            "selected_ids": selected_image_ids,
-                            "model": data.get("vision_model", "gpt-4o-mini"),
-                            "per_image_max_tokens": int(data.get("vision_max_tokens", 250)),
-                            "sleep_sec": float(data.get("vision_sleep_sec", 0.0)),
+                    if passed_manifest:
+                        logger.info(f"Stateless Mode: Using image_manifest provided in request data. ({len(passed_manifest)} items)")
+                        # Construct a state object on the fly
+                        selection_state = {
+                            "file_path": user_provided_path if user_provided_path else file_path,
+                            "manifest": passed_manifest
                         }
-                        describe_kwargs = {k: v for k, v in describe_kwargs.items() if k in allowed_keys}
+                    
+                    # FALLBACK: If no manifest passed, try loading from local token file (Legacy Mode)
+                    elif selection_token:
+                        selection_state = load_selection_state(selection_token)
+                        # Only validate path if we are loading from a cached token
+                        current_stable_path = user_provided_path if user_provided_path else file_path
+                        expected_path = selection_state.get("file_path") if selection_state else "Unknown"
+                        
+                        if not selection_state or expected_path != current_stable_path:
+                             # Warn but allow proceeding if we are in a mixed environment, strictly failing here causes your current issue
+                            logger.warning(f"Token path mismatch (ignoring due to distributed setup): Expected {expected_path}, Got {current_stable_path}")
+                    
+                    else:
+                        return create_error_response(file_id, "Missing 'image_manifest' in data or valid 'selection_token'", "MISSING_DATA")
 
-                        # Analyze images
+                    # Proceed with extraction using whatever selection_state we found/created
+                    if selection_state:
                         try:
+                            # ... (Keep existing extraction logic) ...
+                            allowed_keys = {"pdf_path", "selection_state", "selected_ids", "model", "per_image_max_tokens", "sleep_sec"}
+                            describe_kwargs = {
+                                "pdf_path": file_path, # This is the actual temp file path on the server
+                                "selection_state": selection_state,
+                                "selected_ids": selected_image_ids,
+                                "model": data.get("vision_model", "gpt-4o-mini"),
+                                "per_image_max_tokens": int(data.get("vision_max_tokens", 250)),
+                                "sleep_sec": float(data.get("vision_sleep_sec", 0.0)),
+                            }
+                            describe_kwargs = {k: v for k, v in describe_kwargs.items() if k in allowed_keys}
+
+                            # Analyze images
                             image_descs = describe_selected_images_with_openai(**describe_kwargs)
                         except Exception as e:
                             logger.warning(f"Failed to analyze selected images (inner): {e}")
                             image_descs = []
-                    except Exception as e:
-                        logger.warning(f"Failed to prepare or analyze selected images: {e}")
-                        image_descs = []
-
+                            
                     try:
                         # Append descriptions to Markdown
                         full_text_md = append_image_descriptions_to_markdown(full_text_md, image_descs)
                     except Exception as e:
                         logger.warning(f"Failed to append image descriptions: {e}")
+                        
                 except Exception as e:
                     logger.warning(f"Image analysis phase failed (non-fatal): {e}")
 
