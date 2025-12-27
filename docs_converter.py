@@ -1093,7 +1093,9 @@ def docling_convert_file():
             # Handle Image Mode = SELECTED
             image_descs = []
             selection_state = None
-            
+            image_processing_error = None
+            image_processing_error_type = None
+
             if ext == ".pdf" and image_mode == "selected":
                 try:
                     # NEW: Check if manifest was passed directly (Stateless/Distributed Fix)
@@ -1106,50 +1108,67 @@ def docling_convert_file():
                             "file_path": user_provided_path if user_provided_path else file_path,
                             "manifest": passed_manifest
                         }
-                    
+
                     # FALLBACK: If no manifest passed, try loading from local token file (Legacy Mode)
                     elif selection_token:
                         selection_state = load_selection_state(selection_token)
                         # Only validate path if we are loading from a cached token
                         current_stable_path = user_provided_path if user_provided_path else file_path
                         expected_path = selection_state.get("file_path") if selection_state else "Unknown"
-                        
+
                         if not selection_state or expected_path != current_stable_path:
-                             # Warn but allow proceeding if we are in a mixed environment, strictly failing here causes your current issue
-                            logger.warning(f"Token path mismatch (ignoring due to distributed setup): Expected {expected_path}, Got {current_stable_path}")
-                    
+                             # Track error but allow proceeding if we are in a mixed environment
+                            error_msg = f"Token path mismatch: Expected {expected_path}, Got {current_stable_path}"
+                            logger.warning(f"{error_msg} (ignoring due to distributed setup)")
+                            image_processing_error = error_msg
+                            image_processing_error_type = "IMAGE_MANIFEST_PATH_MISMATCH"
+
                     else:
                         return create_error_response(file_id, "Missing 'image_manifest' in data or valid 'selection_token'", "MISSING_DATA")
 
                     # Proceed with extraction using whatever selection_state we found/created
                     if selection_state:
                         try:
-                            # ... (Keep existing extraction logic) ...
-                            allowed_keys = {"pdf_path", "selection_state", "selected_ids", "model", "per_image_max_tokens", "sleep_sec"}
-                            describe_kwargs = {
-                                "pdf_path": file_path, # This is the actual temp file path on the server
-                                "selection_state": selection_state,
-                                "selected_ids": selected_image_ids,
-                                "model": data.get("vision_model", "gpt-4o-mini"),
-                                "per_image_max_tokens": int(data.get("vision_max_tokens", 250)),
-                                "sleep_sec": float(data.get("vision_sleep_sec", 0.0)),
-                            }
-                            describe_kwargs = {k: v for k, v in describe_kwargs.items() if k in allowed_keys}
+                            # Validate manifest structure
+                            manifest = selection_state.get("manifest", [])
+                            if not isinstance(manifest, list) or len(manifest) == 0:
+                                image_processing_error = "Image manifest is empty or invalid"
+                                image_processing_error_type = "IMAGE_MANIFEST_INVALID"
+                                logger.warning(f"Invalid image manifest for {file_id}")
+                            else:
+                                # ... (Keep existing extraction logic) ...
+                                allowed_keys = {"pdf_path", "selection_state", "selected_ids", "model", "per_image_max_tokens", "sleep_sec"}
+                                describe_kwargs = {
+                                    "pdf_path": file_path, # This is the actual temp file path on the server
+                                    "selection_state": selection_state,
+                                    "selected_ids": selected_image_ids,
+                                    "model": data.get("vision_model", "gpt-4o-mini"),
+                                    "per_image_max_tokens": int(data.get("vision_max_tokens", 250)),
+                                    "sleep_sec": float(data.get("vision_sleep_sec", 0.0)),
+                                }
+                                describe_kwargs = {k: v for k, v in describe_kwargs.items() if k in allowed_keys}
 
-                            # Analyze images
-                            image_descs = describe_selected_images_with_openai(**describe_kwargs)
+                                # Analyze images
+                                image_descs = describe_selected_images_with_openai(**describe_kwargs)
                         except Exception as e:
                             logger.warning(f"Failed to analyze selected images (inner): {e}")
+                            image_processing_error = f"Failed to analyze selected images: {str(e)}"
+                            image_processing_error_type = "IMAGE_ANALYSIS_FAILED"
                             image_descs = []
-                            
+
                     try:
                         # Append descriptions to Markdown
                         full_text_md = append_image_descriptions_to_markdown(full_text_md, image_descs)
                     except Exception as e:
                         logger.warning(f"Failed to append image descriptions: {e}")
-                        
+                        if not image_processing_error:
+                            image_processing_error = f"Failed to append image descriptions: {str(e)}"
+                            image_processing_error_type = "IMAGE_APPEND_FAILED"
+
                 except Exception as e:
                     logger.warning(f"Image analysis phase failed (non-fatal): {e}")
+                    image_processing_error = f"Image analysis phase failed: {str(e)}"
+                    image_processing_error_type = "IMAGE_PROCESSING_FAILED"
 
             # Final Metadata & Response Construction
             try:
@@ -1224,6 +1243,11 @@ def docling_convert_file():
             if image_descs:
                 resp["image_descriptions"] = image_descs
 
+            # Include image processing error information if any occurred
+            if image_processing_error:
+                resp["image_processing_error"] = image_processing_error
+                resp["image_processing_error_type"] = image_processing_error_type
+
             # Build a summary for this conversion run (single-file)
             summary = {
                 "total_files_processed": 1,
@@ -1235,6 +1259,11 @@ def docling_convert_file():
                 # images ignored = images not analyzed (best-effort)
                 "images_ignored": max(0, raw_total_images - image_count_analyzed)
             }
+            # Include error information in summary if present
+            if image_processing_error:
+                summary["image_processing_error"] = image_processing_error
+                summary["image_processing_error_type"] = image_processing_error_type
+
             resp["summary"] = summary
 
             return jsonify(resp)
